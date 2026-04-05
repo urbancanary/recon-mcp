@@ -231,6 +231,30 @@ async def recon_status(portfolio_id: str = None):
     return {"coverage": rows}
 
 
+@app.get("/recon/latest-date")
+async def recon_latest_date(portfolio_id: str = "wnbf", source: str = "bbg"):
+    """Return the most recent date with data for a given source/portfolio."""
+    from recon_db import SUPABASE_URL, _headers
+    import httpx
+    table = f"recon_{source}"
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=_headers(),
+            params={
+                "portfolio_id": f"eq.{portfolio_id}",
+                "select": "date",
+                "order": "date.desc",
+                "limit": "1",
+            },
+        )
+        if resp.status_code == 200:
+            rows = resp.json()
+            if rows:
+                return {"date": rows[0]["date"], "source": source, "portfolio_id": portfolio_id}
+    return {"date": None, "source": source, "portfolio_id": portfolio_id}
+
+
 @app.post("/backfill/coupon-maturity")
 async def trigger_backfill(x_admin_key: str = Header(None, alias="X-Admin-Key")):
     """Manually trigger the coupon/maturity backfill. Admin only."""
