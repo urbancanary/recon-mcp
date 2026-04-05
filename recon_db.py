@@ -323,6 +323,26 @@ async def store_maia(portfolio_id: str, date: str, bonds: list[dict], uploaded_b
     return await _upsert("recon_maia", rows, "portfolio_id,date,isin")
 
 
+async def store_athena_bbg(portfolio_id: str, date: str, rows: list[dict]) -> int:
+    """Store Athena's calculations from BBG prices (absolute dollars, par-scaled).
+
+    Each row: {isin, par, source_price, accrued_t0, accrued_c1, accrued_t1, accrued_c2, accrued_c3}
+    """
+    upsert_rows = [{
+        "portfolio_id": portfolio_id,
+        "date": date,
+        "isin": r.get("isin"),
+        "par": r.get("par"),
+        "source_price": r.get("source_price"),
+        "accrued_t0": r.get("accrued_t0"),
+        "accrued_c1": r.get("accrued_c1"),
+        "accrued_t1": r.get("accrued_t1"),
+        "accrued_c2": r.get("accrued_c2"),
+        "accrued_c3": r.get("accrued_c3"),
+    } for r in rows]
+    return await _upsert("athena_bbg", upsert_rows, "portfolio_id,date,isin")
+
+
 async def store_calcs(portfolio_id: str, date: str, calcs: list[dict]) -> int:
     """Store GA10 calculation results. Upserts by (portfolio_id, date, isin)."""
     rows = [{

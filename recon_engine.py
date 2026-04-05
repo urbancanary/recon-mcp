@@ -15,7 +15,7 @@ import asyncio
 import httpx
 
 from recon_db import (
-    store_bbg, store_admin, store_maia, store_calcs,
+    store_bbg, store_admin, store_maia, store_calcs, store_athena_bbg,
     store_raw_upload, lookup_bond_reference, SUPABASE_URL, _headers,
 )
 
@@ -245,21 +245,23 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
                 if resp.status_code == 200:
                     ga10_bonds = resp.json().get("bonds", [])
                     calcs = []
+                    athena_bbg_rows = []
                     par_lookup = bbg_par or {}
                     for b in ga10_bonds:
                         isin = b.get("isin")
                         if isin not in bbg_prices:
                             continue
                         par = par_lookup.get(isin) or 0
-                        mult = par / 100 if par else 1
+
+                        # recon_calcs — store raw per-100 values for reference
                         calcs.append({
                             "isin": isin,
                             "source_price": bbg_prices.get(isin),
-                            "ga10_accrued": (b.get("accrued_interest") or 0) * mult if b.get("accrued_interest") is not None else None,
-                            "ga10_accrued_c1": (b.get("accrued_interest_c1") or 0) * mult if b.get("accrued_interest_c1") is not None else None,
-                            "ga10_accrued_t1": (b.get("accrued_interest_t1") or 0) * mult if b.get("accrued_interest_t1") is not None else None,
-                            "ga10_accrued_t2": (b.get("accrued_interest_t2") or 0) * mult if b.get("accrued_interest_t2") is not None else None,
-                            "ga10_accrued_t3": (b.get("accrued_interest_t3") or 0) * mult if b.get("accrued_interest_t3") is not None else None,
+                            "ga10_accrued": b.get("accrued_interest"),
+                            "ga10_accrued_c1": b.get("accrued_interest_c1"),
+                            "ga10_accrued_t1": b.get("accrued_interest_t1"),
+                            "ga10_accrued_t2": b.get("accrued_interest_t2"),
+                            "ga10_accrued_t3": b.get("accrued_interest_t3"),
                             "ga10_yield": b.get("yield_to_maturity"),
                             "ga10_yield_c1": b.get("ytm_c1"),
                             "ga10_yield_t1": b.get("ytm_t1"),
@@ -270,9 +272,28 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
                             "ga10_convexity": b.get("convexity"),
                             "ga10_dv01": b.get("dv01"),
                         })
+
+                        # athena_bbg — par-scaled absolute dollars (the display layer)
+                        if par:
+                            mult = par / 100
+                            def _scale(v):
+                                return v * mult if v is not None else None
+                            athena_bbg_rows.append({
+                                "isin": isin,
+                                "par": par,
+                                "source_price": bbg_prices.get(isin),
+                                "accrued_t0": _scale(b.get("accrued_interest")),
+                                "accrued_c1": _scale(b.get("accrued_interest_c1")),
+                                "accrued_t1": _scale(b.get("accrued_interest_t1")),
+                                "accrued_c2": _scale(b.get("accrued_interest_t2")),
+                                "accrued_c3": _scale(b.get("accrued_interest_t3")),
+                            })
+
                     if calcs:
                         await store_calcs(portfolio_id, price_date, calcs)
-                        return len(calcs)
+                    if athena_bbg_rows:
+                        await store_athena_bbg(portfolio_id, price_date, athena_bbg_rows)
+                    return len(calcs)
 
     except Exception as e:
         logger.error("BBG price recalc failed: %r", e)
