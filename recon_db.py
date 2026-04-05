@@ -371,54 +371,74 @@ async def store_calcs(portfolio_id: str, date: str, calcs: list[dict]) -> int:
 
 # ── Read: fetch recon data (joins all sources) ────────────────────────────
 
+_athena_price_cache: dict[tuple, tuple[float, dict]] = {}
+_ATHENA_PRICE_TTL = 300  # 5 minutes
+
+
 async def _fetch_independent_athena_prices(isins: list[str], recon_date: str) -> dict[str, dict]:
     """Get the most recent non-BBG price for each ISIN on or before recon_date.
 
-    Queries ga10-pricing /prices/by-date walking backwards from recon_date until
-    all ISINs are covered, or until 14 days back, whichever comes first.
+    Fires all date queries in parallel (7-day window) to ga10-pricing, then picks
+    the most recent non-BBG price per ISIN. Cached in memory for 5 minutes.
 
     Returns: {isin: {price, price_date, source}}
     """
     import os
+    import time
+    import asyncio
+
+    cache_key = (recon_date, tuple(sorted(isins)))
+    cached = _athena_price_cache.get(cache_key)
+    if cached and (time.time() - cached[0]) < _ATHENA_PRICE_TTL:
+        return cached[1]
+
     ga10_url = os.environ.get("GA10_PRICING_URL", "https://ga10-pricing.urbancanary.workers.dev")
 
-    from datetime import datetime, timedelta
     try:
         start = datetime.strptime(recon_date, "%Y-%m-%d")
     except ValueError:
         return {}
 
-    found: dict[str, dict] = {}
     target_isins = set(isins)
+    lookback_days = 7  # 7 days is usually enough to catch any non-weekend/holiday gap
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        for offset in range(0, 14):
-            if not (target_isins - set(found.keys())):
-                break
-            check_date = (start - timedelta(days=offset)).strftime("%Y-%m-%d")
-            try:
-                resp = await client.get(f"{ga10_url}/prices/by-date?date={check_date}")
-                if resp.status_code != 200:
-                    continue
-                bonds = resp.json().get("bonds", [])
-                for b in bonds:
-                    isin = b.get("isin")
-                    if isin not in target_isins or isin in found:
-                        continue
-                    src = b.get("source")
-                    price = b.get("price") or b.get("clean_price")
-                    # Skip BBG (not independent) and null prices
-                    if src == "BBG" or price is None:
-                        continue
-                    found[isin] = {
-                        "price": float(price),
-                        "price_date": b.get("price_date") or check_date,
-                        "source": src,
-                    }
-            except Exception as e:
-                logger.debug(f"ga10-pricing by-date {check_date}: {e}")
+    # Fire all date queries in parallel
+    async with httpx.AsyncClient(timeout=15) as client:
+        tasks = []
+        date_strs = []
+        for offset in range(lookback_days):
+            d = (start - timedelta(days=offset)).strftime("%Y-%m-%d")
+            date_strs.append(d)
+            tasks.append(client.get(f"{ga10_url}/prices/by-date?date={d}"))
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Walk responses in order (offset=0 is recon_date, then 1 day back, etc.)
+    # Keep the first valid non-BBG price per ISIN — that's the most recent one.
+    found: dict[str, dict] = {}
+    for offset, resp in enumerate(responses):
+        if not (target_isins - set(found.keys())):
+            break
+        if isinstance(resp, Exception) or resp.status_code != 200:
+            continue
+        try:
+            bonds = resp.json().get("bonds", [])
+        except Exception:
+            continue
+        for b in bonds:
+            isin = b.get("isin")
+            if isin not in target_isins or isin in found:
                 continue
+            src = b.get("source")
+            price = b.get("price") or b.get("clean_price")
+            if src == "BBG" or price is None:
+                continue
+            found[isin] = {
+                "price": float(price),
+                "price_date": b.get("price_date") or date_strs[offset],
+                "source": src,
+            }
 
+    _athena_price_cache[cache_key] = (time.time(), found)
     return found
 
 
