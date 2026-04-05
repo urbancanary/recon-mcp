@@ -373,8 +373,10 @@ async def store_calcs(portfolio_id: str, date: str, calcs: list[dict]) -> int:
 async def get_recon_data(portfolio_id: str, date: str) -> dict:
     """Fetch recon data for a portfolio/date from the recon_view.
 
-    Single query — the view does the join + computes derived fields in the DB.
-    Returns display-ready rows. No client-side joining or derivation needed.
+    1. Query recon_view (joins all 4 source tables, computes derived fields)
+    2. Override athena_price with independent price from bond_analytics
+       (otherwise athena_price == bbg_price which isn't useful for recon)
+    3. Return display-ready rows
     """
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
@@ -389,7 +391,46 @@ async def get_recon_data(portfolio_id: str, date: str) -> dict:
         )
         rows = resp.json() if resp.status_code == 200 else []
 
-    # Determine which sources are present by checking if any row has data from that source
+    # Fetch independent Athena prices from bond_analytics (bond-data project)
+    # bond_analytics has one row per ISIN with the latest price from Athena's pricing sources
+    if rows:
+        isins = [r["isin"] for r in rows if r.get("isin")]
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                ba_resp = await client.get(
+                    f"{BOND_DATA_URL}/rest/v1/bond_analytics",
+                    headers={
+                        "apikey": BOND_DATA_KEY,
+                        "Authorization": f"Bearer {BOND_DATA_KEY}",
+                    },
+                    params={
+                        "isin": f"in.({','.join(isins)})",
+                        "select": "isin,price,price_source,price_date",
+                    },
+                )
+                if ba_resp.status_code == 200:
+                    athena_prices = {r["isin"]: r for r in ba_resp.json()}
+                    for row in rows:
+                        ap = athena_prices.get(row["isin"])
+                        if ap and ap.get("price") is not None:
+                            row["athena_price"] = float(ap["price"])
+                            row["athena_price_source"] = ap.get("price_source")
+                            row["athena_price_date"] = ap.get("price_date")
+                            # Recompute athena_mv with the independent price
+                            if row.get("athena_par") is not None:
+                                row["athena_mv"] = (
+                                    float(row["athena_par"]) * float(ap["price"]) / 100
+                                    + float(row.get("athena_accrued_c1") or 0)
+                                )
+        except Exception as e:
+            logger.warning(f"Bond analytics price lookup failed: {e}")
+
+    # Use computed BBG MV (from par × price) if raw BBG MV is missing or in different units
+    for row in rows:
+        if row.get("bbg_mv_computed") is not None:
+            row["bbg_mv"] = row["bbg_mv_computed"]
+
+    # Determine which sources are present
     sources_available = {
         "bbg": any(r.get("bbg_par") is not None or r.get("bbg_price") is not None for r in rows),
         "admin": any(r.get("admin_par") is not None or r.get("admin_price") is not None for r in rows),
@@ -408,8 +449,10 @@ async def get_recon_data(portfolio_id: str, date: str) -> dict:
         "bbg_mv": _sum("bbg_mv"),
         "admin_mv": _sum("admin_mv"),
         "maia_mv": _sum("maia_mv"),
+        "athena_mv": _sum("athena_mv"),
         "bbg_par": _sum("bbg_par"),
         "admin_par": _sum("admin_par"),
+        "athena_par": _sum("athena_par"),
     }
 
     return {
