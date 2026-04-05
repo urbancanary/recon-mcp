@@ -444,18 +444,24 @@ async def process_maia_upload(file_bytes: bytes, filename: str, uploaded_by: str
         else:
             df = pd.read_excel(io.BytesIO(file_bytes), header=None, dtype=str)
     except Exception as e:
+        logger.error(f"Maia file parse failed ({filename}, {len(file_bytes)} bytes): {e}")
         return {"status": "error", "error": f"File parse failed: {e}"}
 
     tsv = df.to_csv(sep="\t", index=False, header=False)
+    logger.info(f"Maia TSV: {len(tsv)} chars, {len(tsv.strip().splitlines())} lines from {filename}")
 
     maia_date = extract_maia_date(tsv)
     if not maia_date:
+        # Log first few lines to debug date detection
+        logger.error(f"Maia date not found. First 3 lines: {tsv.strip().splitlines()[:3]}")
         return {"status": "error", "error": "no date found in Maia file"}
 
     maia_pid = "gcrif" if await maia_is_gcrif(tsv) else "wnbf"
     maia_bonds = parse_maia_tsv(tsv)
+    logger.info(f"Maia parsed: {len(maia_bonds)} bonds, date={maia_date}, pid={maia_pid}")
 
     if not maia_bonds:
+        logger.error(f"Maia no valid bonds. First 5 lines: {tsv.strip().splitlines()[:5]}")
         return {"status": "error", "error": "no valid bond rows parsed"}
 
     # Enrich with bond_reference
