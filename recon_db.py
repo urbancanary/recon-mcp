@@ -13,6 +13,7 @@ All recon queries go through here. Portfolio + date are always explicit keys.
 import os
 import logging
 import httpx
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -370,13 +371,64 @@ async def store_calcs(portfolio_id: str, date: str, calcs: list[dict]) -> int:
 
 # ── Read: fetch recon data (joins all sources) ────────────────────────────
 
+async def _fetch_independent_athena_prices(isins: list[str], recon_date: str) -> dict[str, dict]:
+    """Get the most recent non-BBG price for each ISIN on or before recon_date.
+
+    Queries ga10-pricing /prices/by-date walking backwards from recon_date until
+    all ISINs are covered, or until 14 days back, whichever comes first.
+
+    Returns: {isin: {price, price_date, source}}
+    """
+    import os
+    ga10_url = os.environ.get("GA10_PRICING_URL", "https://ga10-pricing.urbancanary.workers.dev")
+
+    from datetime import datetime, timedelta
+    try:
+        start = datetime.strptime(recon_date, "%Y-%m-%d")
+    except ValueError:
+        return {}
+
+    found: dict[str, dict] = {}
+    target_isins = set(isins)
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        for offset in range(0, 14):
+            if not (target_isins - set(found.keys())):
+                break
+            check_date = (start - timedelta(days=offset)).strftime("%Y-%m-%d")
+            try:
+                resp = await client.get(f"{ga10_url}/prices/by-date?date={check_date}")
+                if resp.status_code != 200:
+                    continue
+                bonds = resp.json().get("bonds", [])
+                for b in bonds:
+                    isin = b.get("isin")
+                    if isin not in target_isins or isin in found:
+                        continue
+                    src = b.get("source")
+                    price = b.get("price") or b.get("clean_price")
+                    # Skip BBG (not independent) and null prices
+                    if src == "BBG" or price is None:
+                        continue
+                    found[isin] = {
+                        "price": float(price),
+                        "price_date": b.get("price_date") or check_date,
+                        "source": src,
+                    }
+            except Exception as e:
+                logger.debug(f"ga10-pricing by-date {check_date}: {e}")
+                continue
+
+    return found
+
+
 async def get_recon_data(portfolio_id: str, date: str) -> dict:
     """Fetch recon data for a portfolio/date from the recon_view.
 
     1. Query recon_view (joins all 4 source tables, computes derived fields)
-    2. Override athena_price with independent price from bond_analytics
-       (otherwise athena_price == bbg_price which isn't useful for recon)
-    3. Return display-ready rows
+    2. Fetch independent Athena prices from ga10-pricing (date-locked ≤ recon_date)
+    3. Override athena_price with the most recent non-BBG price on or before recon_date
+    4. Return display-ready rows
     """
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
@@ -391,39 +443,34 @@ async def get_recon_data(portfolio_id: str, date: str) -> dict:
         )
         rows = resp.json() if resp.status_code == 200 else []
 
-    # Fetch independent Athena prices from bond_analytics (bond-data project)
-    # bond_analytics has one row per ISIN with the latest price from Athena's pricing sources
+    # Date-locked independent Athena prices from ga10-pricing
     if rows:
         isins = [r["isin"] for r in rows if r.get("isin")]
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                ba_resp = await client.get(
-                    f"{BOND_DATA_URL}/rest/v1/bond_analytics",
-                    headers={
-                        "apikey": BOND_DATA_KEY,
-                        "Authorization": f"Bearer {BOND_DATA_KEY}",
-                    },
-                    params={
-                        "isin": f"in.({','.join(isins)})",
-                        "select": "isin,price,price_source,price_date",
-                    },
-                )
-                if ba_resp.status_code == 200:
-                    athena_prices = {r["isin"]: r for r in ba_resp.json()}
-                    for row in rows:
-                        ap = athena_prices.get(row["isin"])
-                        if ap and ap.get("price") is not None:
-                            row["athena_price"] = float(ap["price"])
-                            row["athena_price_source"] = ap.get("price_source")
-                            row["athena_price_date"] = ap.get("price_date")
-                            # Recompute athena_mv with the independent price
-                            if row.get("athena_par") is not None:
-                                row["athena_mv"] = (
-                                    float(row["athena_par"]) * float(ap["price"]) / 100
-                                    + float(row.get("athena_accrued_c1") or 0)
-                                )
+            athena_prices = await _fetch_independent_athena_prices(isins, date)
+            for row in rows:
+                ap = athena_prices.get(row["isin"])
+                if ap:
+                    row["athena_price"] = ap["price"]
+                    row["athena_price_source"] = ap["source"]
+                    row["athena_price_date"] = ap["price_date"]
+                    row["athena_price_stale_days"] = (
+                        (datetime.strptime(date, "%Y-%m-%d") - datetime.strptime(ap["price_date"], "%Y-%m-%d")).days
+                        if ap.get("price_date") else None
+                    )
+                    # Recompute athena_mv with the independent price
+                    if row.get("athena_par") is not None:
+                        row["athena_mv"] = (
+                            float(row["athena_par"]) * ap["price"] / 100
+                            + float(row.get("athena_accrued_c1") or 0)
+                        )
+                else:
+                    # No independent price available — clear athena_price rather than leave BBG value
+                    row["athena_price"] = None
+                    row["athena_price_source"] = None
+                    row["athena_mv"] = None
         except Exception as e:
-            logger.warning(f"Bond analytics price lookup failed: {e}")
+            logger.warning(f"Independent Athena price lookup failed: {e}")
 
     # Use computed BBG MV (from par × price) if raw BBG MV is missing or in different units
     for row in rows:
