@@ -128,6 +128,39 @@ async def upload_bbg(
     return result
 
 
+@app.post("/upload/auto")
+async def upload_auto(
+    file: UploadFile = File(...),
+    x_user_email: str = Header(None, alias="X-User-Email"),
+):
+    """Auto-detect BBG vs admin NAV by reading the file header, then route
+    to the correct processor. Used for the legacy /api/gcrif/upload path
+    which accepts either format."""
+    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="File must be .xlsx or .xls")
+
+    contents = await file.read()
+    if len(contents) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large (max 10MB)")
+
+    from bbg_parser import is_bbg_export
+
+    if is_bbg_export(contents):
+        result = await process_bbg_upload(
+            file_bytes=contents, filename=file.filename,
+            uploaded_by=x_user_email or "unknown",
+        )
+    else:
+        result = await process_admin_upload(
+            file_bytes=contents, filename=file.filename,
+            uploaded_by=x_user_email or "unknown",
+        )
+
+    if result.get("status") == "error":
+        raise HTTPException(status_code=422, detail=result.get("error"))
+    return result
+
+
 @app.post("/upload/admin")
 async def upload_admin(
     file: UploadFile = File(...),
