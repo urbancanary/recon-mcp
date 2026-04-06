@@ -238,6 +238,50 @@ def parse_maia_tsv(tsv: str) -> tuple[list[dict], dict]:
     return bonds, meta
 
 
+# ── Admin prices → bond-data ────────────────────────────────────────────────
+
+async def _store_admin_prices_to_bond_data(admin_bonds: list[dict], price_date: str):
+    """Write admin prices to bond_analytics_dated in bond-data Supabase.
+
+    This gives Athena a price history even when CBonds/ETF scraper hasn't run.
+    Source = 'admin'. Upserts by (isin, price_date, source).
+    """
+    from recon_db import BOND_DATA_URL, _bond_data_headers
+    rows = []
+    for b in admin_bonds:
+        price = b.get("price")
+        if not b.get("isin") or price is None:
+            continue
+        rows.append({
+            "isin": b["isin"],
+            "price_date": price_date,
+            "source": "admin",
+            "price": float(price),
+            "currency": b.get("currency", "USD"),
+            "description": b.get("description"),
+            "coupon": float(b["coupon"]) if b.get("coupon") is not None else None,
+            "maturity_date": b.get("maturity_date") or None,
+        })
+
+    if not rows:
+        return
+
+    try:
+        headers = {**_bond_data_headers(), "Prefer": "return=minimal,resolution=merge-duplicates"}
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{BOND_DATA_URL}/rest/v1/bond_analytics_dated?on_conflict=isin,price_date,source",
+                headers=headers,
+                json=rows,
+            )
+            if resp.status_code in (200, 201):
+                logger.info(f"Admin prices → bond_analytics_dated: {len(rows)} rows stored for {price_date}")
+            else:
+                logger.warning(f"Admin prices → bond_analytics_dated failed: {resp.status_code} {resp.text[:300]}")
+    except Exception as e:
+        logger.warning(f"Admin prices → bond_analytics_dated error: {e}")
+
+
 # ── GA10 orchestration ──────────────────────────────────────────────────────
 
 async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
@@ -475,6 +519,9 @@ async def process_admin_upload(file_bytes: bytes, filename: str, uploaded_by: st
             uploaded_by=uploaded_by, bonds_parsed=len(admin_bonds),
         ),
     )
+
+    # Write admin prices to bond_analytics_dated (bond-data Supabase)
+    asyncio.create_task(_store_admin_prices_to_bond_data(admin_bonds, admin_date))
 
     # Sync bond data for uploaded ISINs
     admin_isins = [b["isin"] for b in admin_bonds if b.get("isin")]
