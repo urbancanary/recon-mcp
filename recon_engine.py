@@ -163,10 +163,14 @@ def extract_maia_date(tsv: str, filename: str = "") -> str | None:
     return None
 
 
-def parse_maia_tsv(tsv: str) -> list[dict]:
-    """Parse Maia TSV into bond dicts. Auto-detects columns from header row."""
+def parse_maia_tsv(tsv: str) -> tuple[list[dict], dict]:
+    """Parse Maia TSV into bond dicts. Auto-detects columns from header row.
+
+    Returns: (bonds, metadata) where metadata includes fx_cny_usd if found.
+    """
     col_map = None
     bonds = []
+    meta = {}
 
     for line in tsv.strip().split("\n"):
         cols = [c.strip() for c in line.split("\t")]
@@ -198,11 +202,22 @@ def parse_maia_tsv(tsv: str) -> list[dict]:
                 return None
 
         isin = _col("isin")
+
+        # Extract FX rate from cash rows: "CNY Cash" / "CNY Curncy" has Last Px = CNY/USD rate
+        ticker = _col("ticker").lower()
+        description = _col("description").lower()
+        if ("cny" in ticker or "cny" in description) and ("cash" in ticker or "cash" in description or "curncy" in ticker):
+            price = _num("price")
+            if price and 0.1 < price < 0.2:  # sanity check: CNY/USD is ~0.14
+                meta["fx_cny_usd"] = price
+                meta["fx_cnh_per_usd"] = round(1.0 / price, 6)
+                logger.info(f"Maia FX extracted: CNY/USD={price}, CNH/USD={meta['fx_cnh_per_usd']}")
+            continue
+
         if not ISIN_RE.match(isin):
             continue
 
         grouping = _col("grouping").lower()
-        ticker = _col("ticker").lower()
         if grouping == "cash" or ticker == "cash" or ticker.startswith("cash_"):
             continue
 
@@ -220,7 +235,7 @@ def parse_maia_tsv(tsv: str) -> list[dict]:
             "mv": mv,
         })
 
-    return bonds
+    return bonds, meta
 
 
 # ── GA10 orchestration ──────────────────────────────────────────────────────
@@ -501,8 +516,8 @@ async def process_maia_upload(file_bytes: bytes, filename: str, uploaded_by: str
         return {"status": "error", "error": "no date found in Maia file"}
 
     maia_pid = "gcrif" if await maia_is_gcrif(tsv) else "wnbf"
-    maia_bonds = parse_maia_tsv(tsv)
-    logger.info(f"Maia parsed: {len(maia_bonds)} bonds, date={maia_date}, pid={maia_pid}")
+    maia_bonds, maia_meta = parse_maia_tsv(tsv)
+    logger.info(f"Maia parsed: {len(maia_bonds)} bonds, date={maia_date}, pid={maia_pid}, meta={maia_meta}")
 
     if not maia_bonds:
         logger.error(f"Maia no valid bonds. First 5 lines: {tsv.strip().splitlines()[:5]}")
@@ -519,8 +534,9 @@ async def process_maia_upload(file_bytes: bytes, filename: str, uploaded_by: str
         b["coupon"] = ref.get("coupon")
         b["maturity_date"] = ref.get("maturity_date") or None
 
+    fx_rate = maia_meta.get("fx_cnh_per_usd")
     await asyncio.gather(
-        store_maia(maia_pid, maia_date, maia_bonds, uploaded_by),
+        store_maia(maia_pid, maia_date, maia_bonds, uploaded_by, fx_cnh_per_usd=fx_rate),
         store_raw_upload(
             source="maia", portfolio_id=maia_pid, date=maia_date,
             file_bytes=file_bytes, filename=filename,

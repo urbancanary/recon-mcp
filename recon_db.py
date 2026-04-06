@@ -399,7 +399,8 @@ async def store_admin(portfolio_id: str, date: str, bonds: list[dict], uploaded_
     return await _upsert("recon_admin", rows, "portfolio_id,date,isin")
 
 
-async def store_maia(portfolio_id: str, date: str, bonds: list[dict], uploaded_by: str = None) -> int:
+async def store_maia(portfolio_id: str, date: str, bonds: list[dict],
+                     uploaded_by: str = None, fx_cnh_per_usd: float = None) -> int:
     """Store Maia holdings data. Upserts by (portfolio_id, date, isin)."""
     rows = [{
         "portfolio_id": portfolio_id,
@@ -413,6 +414,7 @@ async def store_maia(portfolio_id: str, date: str, bonds: list[dict], uploaded_b
         "price": b.get("price"),
         "mv": b.get("mv"),
         "uploaded_by": uploaded_by,
+        "fx_cnh_per_usd": fx_cnh_per_usd,
     } for b in bonds]
     return await _upsert("recon_maia", rows, "portfolio_id,date,isin")
 
