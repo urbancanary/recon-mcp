@@ -23,6 +23,7 @@ from recon_engine import (
     process_admin_upload,
     process_maia_upload,
 )
+from alerts import alert_upload_failed
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -124,6 +125,7 @@ async def upload_bbg(
         portfolio_override=portfolio_id,
     )
     if result.get("status") == "error":
+        await alert_upload_failed("bbg", file.filename, result.get("error", "unknown"), x_user_email)
         raise HTTPException(status_code=422, detail=result.get("error"))
     return result
 
@@ -157,6 +159,7 @@ async def upload_auto(
         )
 
     if result.get("status") == "error":
+        await alert_upload_failed("auto", file.filename, result.get("error", "unknown"), x_user_email)
         raise HTTPException(status_code=422, detail=result.get("error"))
     return result
 
@@ -180,6 +183,7 @@ async def upload_admin(
         uploaded_by=x_user_email or "unknown",
     )
     if result.get("status") == "error":
+        await alert_upload_failed("admin", file.filename, result.get("error", "unknown"), x_user_email)
         raise HTTPException(status_code=422, detail=result.get("error"))
     return result
 
@@ -205,6 +209,7 @@ async def upload_maia(
         uploaded_by=x_user_email or "unknown",
     )
     if result.get("status") == "error":
+        await alert_upload_failed("maia", file.filename, result.get("error", "unknown"), x_user_email)
         raise HTTPException(status_code=422, detail=result.get("error"))
     return result
 

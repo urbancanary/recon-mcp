@@ -18,6 +18,10 @@ from recon_db import (
     store_bbg, store_admin, store_maia, store_calcs, store_athena_bbg,
     store_raw_upload, lookup_bond_reference, SUPABASE_URL, _headers,
 )
+from alerts import (
+    alert_ga10_partial_failure, alert_upload_failed,
+    alert_upload_success, alert_data_quality,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -399,6 +403,8 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
     # Trigger GA10 recalc (fire-and-forget — can take minutes)
     asyncio.create_task(recalc_with_bbg_prices(price_bonds, bbg_date, pid, position_bonds))
 
+    asyncio.create_task(alert_upload_success("bbg", pid, bbg_date, len(bbg_bonds), filename))
+
     return {
         "status": "ok",
         "portfolio_id": pid,
@@ -445,6 +451,8 @@ async def process_admin_upload(file_bytes: bytes, filename: str, uploaded_by: st
             uploaded_by=uploaded_by, bonds_parsed=len(admin_bonds),
         ),
     )
+
+    asyncio.create_task(alert_upload_success("admin", admin_pid, admin_date, len(admin_bonds), filename))
 
     return {
         "status": "ok",
@@ -506,6 +514,8 @@ async def process_maia_upload(file_bytes: bytes, filename: str, uploaded_by: str
             uploaded_by=uploaded_by, bonds_parsed=len(maia_bonds),
         ),
     )
+
+    asyncio.create_task(alert_upload_success("maia", maia_pid, maia_date, len(maia_bonds), filename))
 
     return {
         "status": "ok",
