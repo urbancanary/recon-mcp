@@ -243,6 +243,7 @@ ALLOWED_VIEWS = {
     "v_athena_bbg_yield",
     "v_athena_bbg_duration",
     "v_athena_bbg_value",
+    "v_nav_summary",
 }
 
 
