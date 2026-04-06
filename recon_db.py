@@ -573,8 +573,16 @@ async def get_recon_data(portfolio_id: str, date: str) -> dict:
                         (datetime.strptime(date, "%Y-%m-%d") - datetime.strptime(ap["price_date"], "%Y-%m-%d")).days
                         if ap.get("price_date") else None
                     )
-                    # Recompute athena_mv with the independent price
-                    if row.get("athena_par") is not None:
+
+                    # If "independent" price matches BBG exactly, it's not independent —
+                    # GA10 was fed BBG prices and echoed them back. Clear it.
+                    bbg_px = row.get("bbg_price")
+                    if bbg_px is not None and abs(ap["price"] - float(bbg_px)) < 0.001:
+                        row["athena_price"] = None
+                        row["athena_price_source"] = None
+                        row["athena_mv"] = None
+                    elif row.get("athena_par") is not None:
+                        # Recompute athena_mv with the genuinely independent price
                         row["athena_mv"] = (
                             float(row["athena_par"]) * ap["price"] / 100
                             + float(row.get("athena_accrued_c1") or 0)
