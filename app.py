@@ -238,6 +238,8 @@ async def recon_data(portfolio_id: str = "wnbf", date: str = None):
 ALLOWED_VIEWS = {
     "v_athena_bbg_accrued",
     "v_athena_admin_accrued",
+    "v_athena_maia_accrued",
+    "v_athena_all_accrued",
     "v_athena_bbg_yield",
     "v_athena_bbg_duration",
     "v_athena_bbg_value",
