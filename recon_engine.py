@@ -119,13 +119,37 @@ MAIA_LEGACY_MAP = {
 }
 
 
-def extract_maia_date(tsv: str) -> str | None:
-    """Extract date from Maia TSV. Looks for DD/MM/YYYY pattern."""
+def extract_maia_date(tsv: str, filename: str = "") -> str | None:
+    """Extract date from Maia TSV or filename.
+
+    Tries:
+    1. DD/MM/YYYY in any cell of the TSV
+    2. Date embedded in filename (e.g. MAIA227032026.xlsx → 27/03/2026)
+    """
+    # Try TSV cells first
     for line in tsv.strip().split("\n")[:50]:
         for col in line.split("\t"):
             m = MAIA_DATE_RE.match(col.strip())
             if m:
                 return f"{m.group(3)}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
+
+    # Fallback: extract from filename
+    # Patterns: MAIA227032026.xlsx (MAIA2 + DDMMYYYY), MAIA_27-03-2026.xlsx, maia_2026-03-27.xlsx
+    if filename:
+        import re
+        # MAIA2DDMMYYYY
+        m = re.search(r'MAIA2?(\d{2})(\d{2})(\d{4})', filename, re.IGNORECASE)
+        if m:
+            return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+        # YYYY-MM-DD in filename
+        m = re.search(r'(\d{4})-(\d{2})-(\d{2})', filename)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        # DD-MM-YYYY in filename
+        m = re.search(r'(\d{2})-(\d{2})-(\d{4})', filename)
+        if m:
+            return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+
     return None
 
 
@@ -450,10 +474,9 @@ async def process_maia_upload(file_bytes: bytes, filename: str, uploaded_by: str
     tsv = df.to_csv(sep="\t", index=False, header=False)
     logger.info(f"Maia TSV: {len(tsv)} chars, {len(tsv.strip().splitlines())} lines from {filename}")
 
-    maia_date = extract_maia_date(tsv)
+    maia_date = extract_maia_date(tsv, filename=filename)
     if not maia_date:
-        # Log first few lines to debug date detection
-        logger.error(f"Maia date not found. First 3 lines: {tsv.strip().splitlines()[:3]}")
+        logger.error(f"Maia date not found. Filename: {filename}. First 3 lines: {tsv.strip().splitlines()[:3]}")
         return {"status": "error", "error": "no date found in Maia file"}
 
     maia_pid = "gcrif" if await maia_is_gcrif(tsv) else "wnbf"
