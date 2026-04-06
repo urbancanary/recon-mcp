@@ -138,13 +138,19 @@ def extract_maia_date(tsv: str, filename: str = "") -> str | None:
                 return f"{m.group(3)}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
 
     # Fallback: extract from filename
-    # Patterns: MAIA227032026.xlsx (MAIA2 + DDMMYYYY), MAIA_27-03-2026.xlsx, maia_2026-03-27.xlsx
+    # Patterns: MAIA227032026.xlsx, maia_views310326.xlsx, MAIA_27-03-2026.xlsx, maia_2026-03-27.xlsx
     if filename:
         import re
-        # MAIA2DDMMYYYY
+        # MAIA2DDMMYYYY (8-digit year)
         m = re.search(r'MAIA2?(\d{2})(\d{2})(\d{4})', filename, re.IGNORECASE)
         if m:
             return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+        # 6-digit DDMMYY anywhere in filename (e.g. maia_views310326.xlsx)
+        m = re.search(r'(\d{2})(\d{2})(\d{2})(?=\.\w+$)', filename)
+        if m:
+            year = int(m.group(3))
+            year_full = 2000 + year if year < 100 else year
+            return f"{year_full}-{m.group(2)}-{m.group(1)}"
         # YYYY-MM-DD in filename
         m = re.search(r'(\d{4})-(\d{2})-(\d{2})', filename)
         if m:
@@ -533,4 +539,6 @@ async def process_maia_upload(file_bytes: bytes, filename: str, uploaded_by: str
         "portfolio_id": maia_pid,
         "date": maia_date,
         "bonds_parsed": len(maia_bonds),
+        "bonds": len(maia_bonds),
+        "rows": len(tsv.strip().splitlines()),
     }
