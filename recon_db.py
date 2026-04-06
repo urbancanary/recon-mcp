@@ -57,20 +57,23 @@ BOND_DATA_URL = "https://xdgicslrdudsqlsudsgv.supabase.co"
 BOND_DATA_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhkZ2ljc2xyZHVkc3Fsc3Vkc2d2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM1NDc5NTMsImV4cCI6MjA4OTEyMzk1M30.Pn7MNCqJX_AolIoNclKd7Qu7ifCqTHdCZ-rnaeNpYZk"
 
 
+def _bond_data_headers():
+    return {
+        "apikey": BOND_DATA_KEY,
+        "Authorization": f"Bearer {BOND_DATA_KEY}",
+    }
+
+
 async def lookup_bond_reference(isins: list[str]) -> dict[str, dict]:
     """Look up description, currency, coupon, maturity from bond_reference table."""
     if not isins:
         return {}
-    headers = {
-        "apikey": BOND_DATA_KEY,
-        "Authorization": f"Bearer {BOND_DATA_KEY}",
-    }
     isin_list = ",".join(isins)
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
                 f"{BOND_DATA_URL}/rest/v1/bond_reference",
-                headers=headers,
+                headers=_bond_data_headers(),
                 params={
                     "isin": f"in.({isin_list})",
                     "select": "isin,ticker_description,currency,coupon,maturity_date,standard_country,issuer_name",
@@ -90,6 +93,96 @@ async def lookup_bond_reference(isins: list[str]) -> dict[str, dict]:
     except Exception as e:
         logger.warning(f"Bond reference lookup failed: {e}")
     return {}
+
+
+# ── Sync: populate local_bond_* tables in Athena Supabase from bond-data ────
+# These local tables power the recon_view JOINs (fast, indexed).
+# Called on upload and on startup.
+
+async def sync_bond_data(isins: list[str] = None) -> dict:
+    """Sync bond identity, reference, and analytics from bond-data into local tables.
+
+    If isins is None, syncs all ISINs found in recon tables.
+    Returns counts of rows synced per table.
+    """
+    import asyncio
+
+    # If no ISINs provided, gather all unique ISINs from recon tables
+    if not isins:
+        _ensure_key()
+        async with httpx.AsyncClient(timeout=15) as client:
+            tables = ["recon_bbg", "recon_admin", "recon_maia"]
+            tasks = [
+                client.get(f"{SUPABASE_URL}/rest/v1/{t}", headers=_headers(),
+                           params={"select": "isin", "limit": "5000"})
+                for t in tables
+            ]
+            resps = await asyncio.gather(*tasks, return_exceptions=True)
+        all_isins = set()
+        for resp in resps:
+            if isinstance(resp, Exception) or resp.status_code != 200:
+                continue
+            for r in resp.json():
+                if r.get("isin"):
+                    all_isins.add(r["isin"])
+        isins = list(all_isins)
+
+    if not isins:
+        return {"synced": 0, "reason": "no ISINs to sync"}
+
+    isin_filter = ",".join(isins)
+    bdh = _bond_data_headers()
+    counts = {}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        # Fetch all three sources from bond-data in parallel
+        identity_req = client.get(
+            f"{BOND_DATA_URL}/rest/v1/bond_identity",
+            headers=bdh,
+            params={
+                "isin": f"in.({isin_filter})",
+                "select": "isin,branded_description,branded_ticker,issuer_description,coupon,maturity_date",
+            },
+        )
+        reference_req = client.get(
+            f"{BOND_DATA_URL}/rest/v1/bond_reference",
+            headers=bdh,
+            params={
+                "isin": f"in.({isin_filter})",
+                "select": "isin,ticker_description,currency,standard_country,sector,applied_rating,coupon,maturity_date,day_count",
+            },
+        )
+        analytics_req = client.get(
+            f"{BOND_DATA_URL}/rest/v1/bond_analytics",
+            headers=bdh,
+            params={
+                "isin": f"in.({isin_filter})",
+                "select": "isin,price,price_date,price_source,ytw,oad,oas,spread,duration,accrued_interest",
+            },
+        )
+
+        id_resp, ref_resp, ana_resp = await asyncio.gather(
+            identity_req, reference_req, analytics_req, return_exceptions=True
+        )
+
+    # Upsert each into local tables in Athena Supabase
+    if not isinstance(id_resp, Exception) and id_resp.status_code == 200:
+        rows = id_resp.json()
+        if rows:
+            counts["local_bond_identity"] = await _upsert("local_bond_identity", rows, "isin")
+
+    if not isinstance(ref_resp, Exception) and ref_resp.status_code == 200:
+        rows = ref_resp.json()
+        if rows:
+            counts["local_bond_reference"] = await _upsert("local_bond_reference", rows, "isin")
+
+    if not isinstance(ana_resp, Exception) and ana_resp.status_code == 200:
+        rows = ana_resp.json()
+        if rows:
+            counts["local_bond_analytics"] = await _upsert("local_bond_analytics", rows, "isin")
+
+    logger.info(f"Bond data sync complete: {counts}")
+    return counts
 
 
 # ── Storage: upload raw files + track metadata ─────────────────────────────

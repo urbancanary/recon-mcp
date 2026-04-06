@@ -17,6 +17,7 @@ from recon_db import (
     get_recon_data,
     get_recon_status,
     backfill_coupon_maturity,
+    sync_bond_data,
 )
 from recon_engine import (
     process_bbg_upload,
@@ -39,9 +40,14 @@ _backfill_status: dict = {"coupon_maturity": None}
 
 
 async def _startup_backfill():
-    """On startup, fill in any missing coupon/maturity from bond_reference."""
+    """On startup, sync bond data from bond-data Supabase and backfill missing fields."""
     await asyncio.sleep(5)  # Let the server finish starting
     try:
+        # Sync bond identity/reference/analytics into local tables
+        sync_result = await sync_bond_data()
+        _backfill_status["bond_data_sync"] = sync_result
+        logger.info("Bond data sync complete: %s", sync_result)
+
         bbg_result = await backfill_coupon_maturity("recon_bbg")
         maia_result = await backfill_coupon_maturity("recon_maia")
         _backfill_status["coupon_maturity"] = {
@@ -229,6 +235,49 @@ async def recon_data(portfolio_id: str = "wnbf", date: str = None):
     return await get_recon_data(portfolio_id, date)
 
 
+ALLOWED_VIEWS = {
+    "v_athena_bbg_accrued",
+    "v_athena_admin_accrued",
+    "v_athena_bbg_yield",
+    "v_athena_bbg_duration",
+    "v_athena_bbg_value",
+}
+
+
+@app.get("/recon/view/{view_name}")
+async def recon_view_query(view_name: str, portfolio_id: str = "wnbf", date: str = None):
+    """Query a named recon view directly. Returns pre-computed diffs from SQL."""
+    if view_name not in ALLOWED_VIEWS:
+        raise HTTPException(status_code=404, detail=f"Unknown view: {view_name}")
+    if not date:
+        raise HTTPException(status_code=400, detail="date parameter required")
+
+    from recon_db import SUPABASE_URL, _headers
+    import httpx
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/{view_name}",
+            headers=_headers(),
+            params={
+                "portfolio_id": f"eq.{portfolio_id}",
+                "date": f"eq.{date}",
+                "select": "*",
+            },
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Supabase query failed: {resp.status_code}")
+        rows = resp.json()
+
+    return {
+        "view": view_name,
+        "portfolio_id": portfolio_id,
+        "date": date,
+        "bonds": rows,
+        "count": len(rows),
+    }
+
+
 @app.get("/recon/status")
 async def recon_status(portfolio_id: str = None):
     """Get date×source coverage matrix."""
@@ -258,6 +307,13 @@ async def recon_latest_date(portfolio_id: str = "wnbf", source: str = "bbg"):
             if rows:
                 return {"date": rows[0]["date"], "source": source, "portfolio_id": portfolio_id}
     return {"date": None, "source": source, "portfolio_id": portfolio_id}
+
+
+@app.post("/sync/bond-data")
+async def trigger_sync():
+    """Manually trigger sync of bond identity/reference/analytics from bond-data."""
+    result = await sync_bond_data()
+    return result
 
 
 @app.post("/backfill/coupon-maturity")
