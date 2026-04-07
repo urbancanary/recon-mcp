@@ -380,8 +380,9 @@ async def recon_view_query(view_name: str, portfolio_id: str = "wnbf", date: str
 
                         if r["athena_price"] is not None:
                             r["px_diff"] = round(float(r["athena_price"]) - float(bp), 6)
-                            if r.get("nominal") is not None:
-                                mv = float(r["nominal"]) * float(r["athena_price"]) / 100
+                            par = r.get("athena_par") or r.get("nominal") or r.get("bbg_par") or r.get("admin_nominal")
+                            if par is not None:
+                                mv = float(par) * float(r["athena_price"]) / 100
                                 # For GCRIF USD bonds, convert to CNH
                                 if r.get("_gcrif_fx"):
                                     mv = mv * r["_gcrif_fx"]
