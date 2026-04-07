@@ -621,6 +621,101 @@ async def trigger_recalc_all():
     return result
 
 
+@app.post("/recalc/bond")
+async def recalc_single_bond(isin: str, date: str, portfolio_id: str = "wnbf"):
+    """Force recalc a single bond via GA10 gateway. Updates recon_calcs + athena_bbg."""
+    import os
+    import httpx
+    from datetime import datetime, timedelta
+    from recon_db import SUPABASE_URL, _headers, store_calcs, store_athena_bbg
+
+    gw_url = os.environ.get("GA10_GATEWAY_URL", "https://ga10-gateway.urbancanary.workers.dev")
+
+    # Get BBG data for this bond (price + par)
+    async with httpx.AsyncClient(timeout=45) as client:
+        bbg_resp = await client.get(f"{SUPABASE_URL}/rest/v1/recon_bbg", headers=_headers(), params={
+            "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}", "isin": f"eq.{isin}",
+            "select": "isin,par,price,accrued",
+        })
+        bbg_rows = bbg_resp.json() if bbg_resp.status_code == 200 else []
+        if not bbg_rows:
+            return {"error": f"No BBG data for {isin} on {date}"}
+        bbg = bbg_rows[0]
+        price = bbg.get("price")
+        par = bbg.get("par") or 0
+        if not price:
+            return {"error": f"No price for {isin}"}
+
+        price = float(price)
+        par = float(par)
+
+        # Settlement dates: T+0, C+1
+        d0 = datetime.strptime(date, "%Y-%m-%d")
+        c1_date = (d0 + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        # Call gateway for T+0 and C+1
+        async def call_gw(settle):
+            resp = await client.post(f"{gw_url}/api/v1/bond/analysis", json={
+                "isin": isin, "price": price, "settlement_date": settle, "include_cbonds_data": True,
+            })
+            if resp.status_code == 200:
+                return resp.json().get("analytics", {})
+            return {}
+
+        t0, c1 = await asyncio.gather(call_gw(date), call_gw(c1_date))
+
+        # Build recon_calcs row
+        calc = {
+            "isin": isin,
+            "source_price": price,
+            "ga10_accrued": t0.get("accrued_interest"),
+            "ga10_accrued_c1": c1.get("accrued_interest"),
+            "ga10_accrued_t1": None,
+            "ga10_accrued_t2": None,
+            "ga10_accrued_t3": None,
+            "ga10_yield": t0.get("yield_to_maturity") or t0.get("ytm"),
+            "ga10_yield_c1": c1.get("ytm") or c1.get("yield_to_maturity"),
+            "ga10_yield_t1": None,
+            "ga10_yield_worst": t0.get("ytw") or t0.get("yield_to_maturity") or t0.get("ytm"),
+            "ga10_duration": t0.get("modified_duration") or t0.get("duration"),
+            "ga10_duration_worst": t0.get("duration_worst"),
+            "ga10_spread": t0.get("spread"),
+            "ga10_convexity": t0.get("convexity"),
+            "ga10_dv01": t0.get("dv01") or t0.get("pvbp"),
+        }
+        await store_calcs(portfolio_id, date, [calc])
+
+        # Build athena_bbg row if we have par
+        if par:
+            mult = par / 100
+            def _scale(v):
+                return v * mult if v is not None else None
+            athena_row = {
+                "isin": isin,
+                "par": par,
+                "source_price": price,
+                "accrued_t0": _scale(t0.get("accrued_interest")),
+                "accrued_c1": _scale(c1.get("accrued_interest")),
+                "accrued_t1": None, "accrued_c2": None, "accrued_c3": None,
+            }
+            await store_athena_bbg(portfolio_id, date, [athena_row])
+
+        return {
+            "isin": isin,
+            "date": date,
+            "portfolio_id": portfolio_id,
+            "price": price,
+            "par": par,
+            "accrued_t0_per100": t0.get("accrued_interest"),
+            "accrued_c1_per100": c1.get("accrued_interest"),
+            "accrued_c1_scaled": c1.get("accrued_interest", 0) * (par / 100) if par and c1.get("accrued_interest") else None,
+            "yield": t0.get("yield_to_maturity") or t0.get("ytm"),
+            "duration": t0.get("modified_duration") or t0.get("duration"),
+            "frequency": t0.get("frequency"),
+            "day_count": t0.get("day_count"),
+        }
+
+
 
 
 @app.get("/recon/athena-v-ga10")
