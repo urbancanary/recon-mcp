@@ -361,11 +361,13 @@ async def recon_view_query(view_name: str, portfolio_id: str = "wnbf", date: str
             if ap is not None and bp is not None:
                 try:
                     if abs(float(ap) - float(bp)) < 0.001:
-                        # Priority: CBonds/GA10 > admin > BBG (BBG already filtered out)
+                        # Priority: CBonds/GA10 > admin > BBG
+                        # But skip CBonds if it also matches BBG (echo via scheduled_job)
                         cb = cbonds_prices.get(isin)
                         adm_px = admin_prices.get(isin)
 
-                        if cb:
+                        cb_is_echo = cb and abs(cb["price"] - float(bp)) < 0.001
+                        if cb and not cb_is_echo:
                             r["athena_price"] = cb["price"]
                             r["athena_price_source"] = cb["source"]
                         elif adm_px is not None:
