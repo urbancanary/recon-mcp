@@ -300,7 +300,7 @@ async def recon_view_query(view_name: str, portfolio_id: str = "wnbf", date: str
         for r in rows:
             ccy = (r.get("currency") or "").upper()
             if ccy == "USD":
-                for field in ("athena_mv", "bbg_mv", "admin_mv", "maia_mv", "nominal"):
+                for field in ("athena_mv", "bbg_mv", "admin_mv", "maia_mv"):
                     if r.get(field) is not None:
                         try:
                             r[field] = float(r[field]) * fx
