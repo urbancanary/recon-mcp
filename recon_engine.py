@@ -284,6 +284,57 @@ async def _store_admin_prices_to_bond_data(admin_bonds: list[dict], price_date: 
 
 # ── GA10 orchestration ──────────────────────────────────────────────────────
 
+async def recalc_all_existing() -> dict:
+    """Retrigger GA10 recalc for every (portfolio, date) pair in recon_bbg.
+
+    Finds all unique (portfolio_id, date) tuples that have BBG prices,
+    fetches those prices from recon_bbg, and fires recalc_with_bbg_prices
+    for each. Updates athena_bbg + recon_calcs with fresh results.
+
+    Called after sync_bond_data to pick up any convention changes.
+    """
+    from recon_db import SUPABASE_URL, _headers
+
+    # Get all unique (portfolio_id, date) pairs from recon_bbg
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/recon_bbg",
+            headers=_headers(),
+            params={"select": "portfolio_id,date,isin,price,par", "limit": "5000"},
+        )
+        if resp.status_code != 200:
+            logger.error(f"recalc_all: failed to fetch recon_bbg: {resp.status_code}")
+            return {"error": "failed to fetch recon_bbg"}
+        rows = resp.json()
+
+    # Group by (portfolio_id, date)
+    groups: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r["portfolio_id"], r["date"])
+        if key not in groups:
+            groups[key] = {"prices": {}, "par": {}}
+        if r.get("price") is not None:
+            groups[key]["prices"][r["isin"]] = float(r["price"])
+        if r.get("par") is not None:
+            groups[key]["par"][r["isin"]] = float(r["par"])
+
+    logger.info(f"recalc_all: {len(groups)} (portfolio, date) pairs to recalc")
+
+    results = {}
+    for (pid, date), data in groups.items():
+        if not data["prices"]:
+            continue
+        try:
+            count = await recalc_with_bbg_prices(data["prices"], date, pid, data["par"])
+            results[f"{pid}/{date}"] = count
+            logger.info(f"recalc_all: {pid}/{date} → {count} calcs")
+        except Exception as e:
+            results[f"{pid}/{date}"] = f"error: {e}"
+            logger.error(f"recalc_all: {pid}/{date} failed: {e}")
+
+    return {"recalced": len(results), "details": results}
+
+
 async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
                                   portfolio_id: str, bbg_par: dict = None) -> int:
     """Store BBG prices in GA10, trigger recalc, fetch results, store in recon_calcs.

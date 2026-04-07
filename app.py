@@ -333,8 +333,17 @@ async def recon_latest_date(portfolio_id: str = "wnbf", source: str = "bbg"):
 
 @app.post("/sync/bond-data")
 async def trigger_sync():
-    """Manually trigger sync of bond identity/reference/analytics from bond-data."""
+    """Manually trigger sync of bond identity/reference/analytics from bond-data.
+    Also triggers GA10 recalc for all existing data to pick up convention changes."""
     result = await sync_bond_data()
+    return result
+
+
+@app.post("/recalc/all")
+async def trigger_recalc_all():
+    """Manually trigger GA10 recalc for all (portfolio, date) pairs in recon_bbg."""
+    from recon_engine import recalc_all_existing
+    result = await recalc_all_existing()
     return result
 
 

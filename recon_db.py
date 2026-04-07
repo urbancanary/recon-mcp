@@ -182,6 +182,19 @@ async def sync_bond_data(isins: list[str] = None) -> dict:
             counts["local_bond_analytics"] = await _upsert("local_bond_analytics", rows, "isin")
 
     logger.info(f"Bond data sync complete: {counts}")
+
+    # After syncing reference data, retrigger GA10 recalc for all existing
+    # (portfolio, date) pairs. This picks up any convention changes (coupon,
+    # maturity, day_count) that would affect accrued/yield/duration.
+    try:
+        from recon_engine import recalc_all_existing
+        import asyncio
+        asyncio.create_task(recalc_all_existing())
+        counts["recalc_triggered"] = True
+    except Exception as e:
+        logger.warning(f"Post-sync recalc trigger failed: {e}")
+        counts["recalc_triggered"] = False
+
     return counts
 
 
