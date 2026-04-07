@@ -372,14 +372,30 @@ async def compute_accrued_for_all() -> dict:
 
         return results
 
-    # Compute for BBG rows → store in athena_bbg
+    # Only fill gaps — don't overwrite existing GA10 values in athena_bbg
+    # Fetch existing athena_bbg ISINs to skip
+    existing_bbg = set()
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/athena_bbg",
+            headers=_headers(),
+            params={"select": "portfolio_id,date,isin", "accrued_c1": "not.is.null", "limit": "5000"},
+        )
+        if resp.status_code == 200:
+            for r in resp.json():
+                existing_bbg.add((r["portfolio_id"], str(r["date"]), r["isin"]))
+
     bbg_results = _compute_for_rows(bbg_rows)
+    # Filter to only gaps (where GA10 didn't produce a value)
+    bbg_gaps = [r for r in bbg_results
+                if (r["portfolio_id"], r["date"], r["isin"]) not in existing_bbg]
+    logger.info(f"Accrued calc: {len(bbg_results)} computed, {len(bbg_gaps)} are gaps (GA10 had no value)")
+
     bbg_stored = 0
-    if bbg_results:
-        # Group by (portfolio, date) for batch upsert
+    if bbg_gaps:
         from collections import defaultdict
         groups = defaultdict(list)
-        for r in bbg_results:
+        for r in bbg_gaps:
             groups[(r["portfolio_id"], r["date"])].append(r)
         for (pid, dt), batch in groups.items():
             bbg_stored += await store_athena_bbg(pid, dt, batch)
