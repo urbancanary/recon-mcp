@@ -627,7 +627,7 @@ async def recalc_single_bond(isin: str, date: str, portfolio_id: str = "wnbf"):
     import os
     import httpx
     from datetime import datetime, timedelta
-    from recon_db import SUPABASE_URL, _headers, store_calcs, store_athena_bbg
+    from recon_db import SUPABASE_URL, _headers, store_calcs, _upsert
 
     gw_url = os.environ.get("GA10_GATEWAY_URL", "https://ga10-gateway.urbancanary.workers.dev")
 
@@ -698,7 +698,9 @@ async def recalc_single_bond(isin: str, date: str, portfolio_id: str = "wnbf"):
                 "accrued_c1": _scale(c1.get("accrued_interest")),
                 "accrued_t1": None, "accrued_c2": None, "accrued_c3": None,
             }
-            await store_athena_bbg(portfolio_id, date, [athena_row])
+            # Upsert just this one bond — don't use store_athena_bbg which deletes stale rows
+            upsert_row = {"portfolio_id": portfolio_id, "date": date, **athena_row}
+            await _upsert("athena_bbg", [upsert_row], "portfolio_id,date,isin")
 
         return {
             "isin": isin,
