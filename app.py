@@ -309,19 +309,49 @@ async def recon_view_query(view_name: str, portfolio_id: str = "wnbf", date: str
                 r["_fx_converted"] = True
                 r["_fx_rate"] = fx
 
-    # Filter out BBG-echoed prices: if athena_price matches bbg_price exactly,
-    # it's not independent — GA10 was fed BBG prices and returned them.
+    # Filter out BBG-echoed prices and substitute admin prices where available
     if "value" in view_name:
+        # For GCRIF, fetch admin prices as the independent "Athena" source
+        admin_prices = {}
+        if portfolio_id == "gcrif" and date:
+            try:
+                async with httpx.AsyncClient(timeout=5) as adm_client:
+                    adm_resp = await adm_client.get(
+                        f"{SUPABASE_URL}/rest/v1/recon_admin",
+                        headers=_headers(),
+                        params={
+                            "portfolio_id": f"eq.{portfolio_id}",
+                            "date": f"eq.{date}",
+                            "select": "isin,price",
+                        },
+                    )
+                    if adm_resp.status_code == 200:
+                        for ar in adm_resp.json():
+                            if ar.get("isin") and ar.get("price") is not None:
+                                admin_prices[ar["isin"]] = float(ar["price"])
+            except Exception:
+                pass
+
         for r in rows:
             ap = r.get("athena_price")
             bp = r.get("bbg_price")
+            # If athena_price matches BBG exactly, it's not independent
             if ap is not None and bp is not None:
                 try:
                     if abs(float(ap) - float(bp)) < 0.001:
-                        r["athena_price"] = None
-                        r["athena_price_source"] = None
-                        r["athena_mv"] = None
-                        r["px_diff"] = None
+                        # Use admin price as the independent Athena price
+                        adm_px = admin_prices.get(r.get("isin"))
+                        if adm_px is not None:
+                            r["athena_price"] = adm_px
+                            r["athena_price_source"] = "admin"
+                            if r.get("nominal") is not None:
+                                r["athena_mv"] = float(r["nominal"]) * adm_px / 100
+                            r["px_diff"] = round(adm_px - float(bp), 6) if bp else None
+                        else:
+                            r["athena_price"] = None
+                            r["athena_price_source"] = None
+                            r["athena_mv"] = None
+                            r["px_diff"] = None
                         r["mv_diff"] = None
                 except (ValueError, TypeError):
                     pass
