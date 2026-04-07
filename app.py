@@ -274,6 +274,23 @@ async def recon_view_query(view_name: str, portfolio_id: str = "wnbf", date: str
             raise HTTPException(status_code=502, detail=f"Supabase query failed: {resp.status_code}")
         rows = resp.json()
 
+    # Filter out BBG-echoed prices: if athena_price matches bbg_price exactly,
+    # it's not independent — GA10 was fed BBG prices and returned them.
+    if "value" in view_name:
+        for r in rows:
+            ap = r.get("athena_price")
+            bp = r.get("bbg_price")
+            if ap is not None and bp is not None:
+                try:
+                    if abs(float(ap) - float(bp)) < 0.001:
+                        r["athena_price"] = None
+                        r["athena_price_source"] = None
+                        r["athena_mv"] = None
+                        r["px_diff"] = None
+                        r["mv_diff"] = None
+                except (ValueError, TypeError):
+                    pass
+
     return {
         "view": view_name,
         "portfolio_id": portfolio_id,
