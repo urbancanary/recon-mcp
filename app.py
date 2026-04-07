@@ -309,14 +309,17 @@ async def recon_view_query(view_name: str, portfolio_id: str = "wnbf", date: str
                 r["_fx_converted"] = True
                 r["_fx_rate"] = fx
 
-    # Filter out BBG-echoed prices and substitute admin prices where available
+    # Filter out BBG-echoed prices and substitute independent prices
     if "value" in view_name:
-        # For GCRIF, fetch admin prices as the independent "Athena" source
+        # Fetch independent prices: admin + CBonds/GA10
         admin_prices = {}
-        if portfolio_id == "gcrif" and date:
+        cbonds_prices = {}
+
+        if date:
             try:
-                async with httpx.AsyncClient(timeout=5) as adm_client:
-                    adm_resp = await adm_client.get(
+                async with httpx.AsyncClient(timeout=10) as ind_client:
+                    # Admin prices (for all portfolios, not just GCRIF)
+                    adm_task = ind_client.get(
                         f"{SUPABASE_URL}/rest/v1/recon_admin",
                         headers=_headers(),
                         params={
@@ -325,33 +328,61 @@ async def recon_view_query(view_name: str, portfolio_id: str = "wnbf", date: str
                             "select": "isin,price",
                         },
                     )
-                    if adm_resp.status_code == 200:
+                    # CBonds/GA10 prices from ga10-pricing (non-BBG source for recon date)
+                    import os
+                    ga10_url = os.environ.get("GA10_PRICING_URL", "https://ga10-pricing.urbancanary.workers.dev")
+                    cb_task = ind_client.get(f"{ga10_url}/prices/by-date?date={date}")
+
+                    import asyncio
+                    adm_resp, cb_resp = await asyncio.gather(adm_task, cb_task, return_exceptions=True)
+
+                    if not isinstance(adm_resp, Exception) and adm_resp.status_code == 200:
                         for ar in adm_resp.json():
                             if ar.get("isin") and ar.get("price") is not None:
                                 admin_prices[ar["isin"]] = float(ar["price"])
+
+                    if not isinstance(cb_resp, Exception) and cb_resp.status_code == 200:
+                        for cb in cb_resp.json().get("bonds", []):
+                            src = cb.get("source")
+                            px = cb.get("price")
+                            isin = cb.get("isin")
+                            if isin and px is not None and src not in ("BBG", None):
+                                if isin not in cbonds_prices:  # first non-BBG wins
+                                    cbonds_prices[isin] = {"price": float(px), "source": src}
             except Exception:
                 pass
 
         for r in rows:
             ap = r.get("athena_price")
             bp = r.get("bbg_price")
-            # If athena_price matches BBG exactly, it's not independent
+            isin = r.get("isin")
+
+            # If athena_price matches BBG exactly, it's not independent — substitute
             if ap is not None and bp is not None:
                 try:
                     if abs(float(ap) - float(bp)) < 0.001:
-                        # Use admin price as the independent Athena price
-                        adm_px = admin_prices.get(r.get("isin"))
+                        # Priority: admin > CBonds/GA10
+                        adm_px = admin_prices.get(isin)
+                        cb = cbonds_prices.get(isin)
+
                         if adm_px is not None:
                             r["athena_price"] = adm_px
                             r["athena_price_source"] = "admin"
-                            if r.get("nominal") is not None:
-                                r["athena_mv"] = float(r["nominal"]) * adm_px / 100
-                            r["px_diff"] = round(adm_px - float(bp), 6) if bp else None
+                        elif cb:
+                            r["athena_price"] = cb["price"]
+                            r["athena_price_source"] = cb["source"]
                         else:
                             r["athena_price"] = None
                             r["athena_price_source"] = None
                             r["athena_mv"] = None
+
+                        if r["athena_price"] is not None:
+                            r["px_diff"] = round(float(r["athena_price"]) - float(bp), 6)
+                            if r.get("nominal") is not None:
+                                r["athena_mv"] = float(r["nominal"]) * float(r["athena_price"]) / 100
+                        else:
                             r["px_diff"] = None
+
                         r["mv_diff"] = None
                 except (ValueError, TypeError):
                     pass
