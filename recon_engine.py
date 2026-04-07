@@ -582,8 +582,9 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
                     isin = b.get("isin")
                     if isin not in isin_set:
                         continue
-                    if b.get("accrued_interest") is None:
-                        continue  # skip bonds that GA10 couldn't calc
+                    # Skip bonds with no accrued at all (T+0 or C+1)
+                    if b.get("accrued_interest") is None and b.get("accrued_interest_c1") is None:
+                        continue
                     par = par_lookup.get(isin) or 0
 
                     calcs.append({
@@ -594,12 +595,13 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
                         "ga10_accrued_t1": b.get("accrued_interest_t1"),
                         "ga10_accrued_t2": b.get("accrued_interest_t2"),
                         "ga10_accrued_t3": b.get("accrued_interest_t3"),
-                        "ga10_yield": b.get("yield_to_maturity"),
+                        # Prefer T+0, fall back to C+1 for yield/duration
+                        "ga10_yield": b.get("yield_to_maturity") or b.get("ytm_c1"),
                         "ga10_yield_c1": b.get("ytm_c1"),
                         "ga10_yield_t1": b.get("ytm_t1"),
-                        "ga10_yield_worst": b.get("ytw_bbg") or b.get("yield_to_maturity"),
-                        "ga10_duration": b.get("modified_duration"),
-                        "ga10_duration_worst": b.get("duration_worst"),
+                        "ga10_yield_worst": b.get("ytw_bbg") or b.get("yield_to_maturity") or b.get("ytm_c1"),
+                        "ga10_duration": b.get("modified_duration") or b.get("duration_bbg"),
+                        "ga10_duration_worst": b.get("duration_worst") or b.get("duration_worst_bbg"),
                         "ga10_spread": b.get("spread"),
                         "ga10_convexity": b.get("convexity"),
                         "ga10_dv01": b.get("dv01"),
