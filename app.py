@@ -655,8 +655,8 @@ async def recalc_single_bond(isin: str, date: str, portfolio_id: str = "wnbf"):
 
         # Call gateway for T+0 and C+1
         async def call_gw(settle):
-            resp = await client.post(f"{gw_url}/api/v3/bond/analysis", json={
-                "isin": isin, "price": price, "settlement_date": settle,
+            resp = await client.post(f"{gw_url}/api/v1/bond/analysis", json={
+                "isin": isin, "price": price, "settlement_date": settle, "include_cbonds_data": True,
             })
             if resp.status_code == 200:
                 return resp.json().get("analytics", {})
