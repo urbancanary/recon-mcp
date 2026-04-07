@@ -274,6 +274,41 @@ async def recon_view_query(view_name: str, portfolio_id: str = "wnbf", date: str
             raise HTTPException(status_code=502, detail=f"Supabase query failed: {resp.status_code}")
         rows = resp.json()
 
+    # For GCRIF (CNH fund), convert USD bond values to CNH
+    if portfolio_id == "gcrif":
+        fx = 6.912  # default
+        try:
+            async with httpx.AsyncClient(timeout=5) as fx_client:
+                fx_resp = await fx_client.get(
+                    f"{SUPABASE_URL}/rest/v1/recon_maia",
+                    headers=_headers(),
+                    params={
+                        "portfolio_id": "eq.gcrif",
+                        "fx_cnh_per_usd": "not.is.null",
+                        "select": "fx_cnh_per_usd",
+                        "order": "date.desc",
+                        "limit": "1",
+                    },
+                )
+                if fx_resp.status_code == 200:
+                    fx_rows = fx_resp.json()
+                    if fx_rows and fx_rows[0].get("fx_cnh_per_usd"):
+                        fx = float(fx_rows[0]["fx_cnh_per_usd"])
+        except Exception:
+            pass
+
+        for r in rows:
+            ccy = (r.get("currency") or "").upper()
+            if ccy == "USD":
+                for field in ("athena_mv", "bbg_mv", "admin_mv", "maia_mv", "nominal"):
+                    if r.get(field) is not None:
+                        try:
+                            r[field] = float(r[field]) * fx
+                        except (ValueError, TypeError):
+                            pass
+                r["_fx_converted"] = True
+                r["_fx_rate"] = fx
+
     # Filter out BBG-echoed prices: if athena_price matches bbg_price exactly,
     # it's not independent — GA10 was fed BBG prices and returned them.
     if "value" in view_name:
