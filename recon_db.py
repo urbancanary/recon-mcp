@@ -187,15 +187,13 @@ async def sync_bond_data(isins: list[str] = None) -> dict:
     # 1. Compute accrued directly (no GA10 needed — uses bond_reference conventions)
     # 2. Trigger GA10 recalc for yield/duration/spread (still needs QuantLib)
     try:
-        from recon_engine import compute_accrued_for_all, recalc_all_existing
+        from recon_engine import recalc_all_existing
         import asyncio
-        asyncio.create_task(compute_accrued_for_all())
         asyncio.create_task(recalc_all_existing())
-        counts["accrued_calc_triggered"] = True
         counts["ga10_recalc_triggered"] = True
     except Exception as e:
-        logger.warning(f"Post-sync calc trigger failed: {e}")
-        counts["accrued_calc_triggered"] = False
+        logger.warning(f"Post-sync recalc trigger failed: {e}")
+        counts["ga10_recalc_triggered"] = False
 
     return counts
 

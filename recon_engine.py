@@ -282,9 +282,14 @@ async def _store_admin_prices_to_bond_data(admin_bonds: list[dict], price_date: 
         logger.warning(f"Admin prices → bond_analytics_dated error: {e}")
 
 
-# ── Direct accrued computation (no GA10 dependency) ──────────────────────
+# ── GA10 orchestration (accrued removed — GA10 is the single engine) ─────
 
-async def compute_accrued_for_all() -> dict:
+# The direct accrued calculator was removed (commit eba3819) because it
+# guessed coupon schedules wrong. GA10/CBonds owns the bond schedule.
+# If GA10 has gaps, fix bond_reference and retrigger recalc_all_existing.
+
+
+async def _removed_compute_accrued_for_all() -> dict:
     """Compute accrued interest directly from bond_reference for every
     (portfolio, date, isin) tuple in recon_bbg + recon_admin.
 

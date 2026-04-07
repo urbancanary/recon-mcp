@@ -306,8 +306,7 @@ async def recon_view_query(view_name: str, portfolio_id: str = "wnbf", date: str
                             r[field] = float(r[field]) * fx
                         except (ValueError, TypeError):
                             pass
-                r["_fx_converted"] = True
-                r["_fx_rate"] = fx
+                # FX conversion applied (internal — not exposed to UI)
 
     # Filter out BBG-echoed prices and substitute independent prices
     if "value" in view_name:
@@ -445,12 +444,6 @@ async def trigger_recalc_all():
     return result
 
 
-@app.post("/recalc/accrued")
-async def trigger_accrued_calc():
-    """Compute accrued directly from bond_reference for all bonds. No GA10 needed."""
-    from recon_engine import compute_accrued_for_all
-    result = await compute_accrued_for_all()
-    return result
 
 
 @app.post("/backfill/coupon-maturity")
