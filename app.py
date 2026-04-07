@@ -300,13 +300,14 @@ async def recon_view_query(view_name: str, portfolio_id: str = "wnbf", date: str
         for r in rows:
             ccy = (r.get("currency") or "").upper()
             if ccy == "USD":
-                for field in ("athena_mv", "bbg_mv", "admin_mv", "maia_mv"):
+                # admin_mv excluded: admin already reports MV in fund currency (CNH)
+                for field in ("athena_mv", "bbg_mv", "maia_mv"):
                     if r.get(field) is not None:
                         try:
                             r[field] = float(r[field]) * fx
                         except (ValueError, TypeError):
                             pass
-                # FX conversion applied (internal — not exposed to UI)
+                r["_gcrif_fx"] = fx  # carry FX for later athena_mv recalc
 
     # Filter out BBG-echoed prices and substitute independent prices
     if "value" in view_name:
@@ -380,13 +381,21 @@ async def recon_view_query(view_name: str, portfolio_id: str = "wnbf", date: str
                         if r["athena_price"] is not None:
                             r["px_diff"] = round(float(r["athena_price"]) - float(bp), 6)
                             if r.get("nominal") is not None:
-                                r["athena_mv"] = float(r["nominal"]) * float(r["athena_price"]) / 100
+                                mv = float(r["nominal"]) * float(r["athena_price"]) / 100
+                                # For GCRIF USD bonds, convert to CNH
+                                if r.get("_gcrif_fx"):
+                                    mv = mv * r["_gcrif_fx"]
+                                r["athena_mv"] = mv
                         else:
                             r["px_diff"] = None
 
                         r["mv_diff"] = None
                 except (ValueError, TypeError):
                     pass
+
+    # Strip internal fields
+    for r in rows:
+        r.pop("_gcrif_fx", None)
 
     return {
         "view": view_name,
@@ -444,6 +453,225 @@ async def trigger_recalc_all():
     return result
 
 
+
+
+@app.get("/recon/athena-v-ga10")
+async def athena_v_ga10(portfolio_id: str = "wnbf", date: str = None):
+    """Compare stored GA10 v3 bond_analytics against fresh v4 recalculation.
+
+    Athena displays stored v3 results. This endpoint recalculates each bond
+    via GA10 v4 gateway with the same price to catch:
+    - Convention drift (coupon, day count, frequency changes)
+    - Engine version differences (v3 vs v4)
+    - Stale carried-forward data
+    - Description mismatches vs bond_identity
+
+    Calls are batched concurrently (5 at a time) to stay within timeout.
+    """
+    if not date:
+        raise HTTPException(status_code=400, detail="date parameter required")
+
+    import os
+    import httpx
+    import asyncio
+
+    ga10_url = os.environ.get("GA10_PRICING_URL", "https://ga10-pricing.urbancanary.workers.dev")
+    gw_url = os.environ.get("GA10_GATEWAY_URL", "https://ga10-gateway.urbancanary.workers.dev")
+    # Use v3 until v4 is deployed on the gateway, then switch via env var
+    gw_version = os.environ.get("GA10_RECON_VERSION", "v3")
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        # 1. Fetch stored bond_analytics + portfolio holdings + bond_identity in parallel
+        from recon_db import SUPABASE_URL, _headers
+
+        stored_task = client.get(f"{ga10_url}/prices/by-date?date={date}")
+        bbg_task = client.get(
+            f"{SUPABASE_URL}/rest/v1/recon_bbg",
+            headers=_headers(),
+            params={
+                "portfolio_id": f"eq.{portfolio_id}",
+                "date": f"eq.{date}",
+                "select": "isin,par,price,description",
+            },
+        ) if portfolio_id else None
+        identity_task = client.get(
+            f"{SUPABASE_URL}/rest/v1/local_bond_identity",
+            headers=_headers(),
+            params={"select": "isin,branded_description,branded_ticker"},
+        )
+
+        tasks = [stored_task, identity_task]
+        if bbg_task:
+            tasks.append(bbg_task)
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+        stored_resp = responses[0]
+        identity_resp = responses[1]
+        bbg_resp = responses[2] if bbg_task else None
+
+        if isinstance(stored_resp, Exception) or stored_resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="ga10-pricing fetch failed")
+        all_bonds = stored_resp.json().get("bonds", [])
+
+        # Build identity lookup for description recon
+        identity_map = {}
+        if not isinstance(identity_resp, Exception) and identity_resp.status_code == 200:
+            for row in identity_resp.json():
+                identity_map[row["isin"]] = row
+
+        # Build portfolio filter
+        portfolio_isins = None
+        if bbg_resp and not isinstance(bbg_resp, Exception) and bbg_resp.status_code == 200:
+            rows = bbg_resp.json()
+            if rows:
+                portfolio_isins = {r["isin"]: r for r in rows}
+
+        # Filter to portfolio bonds or CBonds watchlist bonds
+        if portfolio_isins:
+            bonds = [b for b in all_bonds if b["isin"] in portfolio_isins]
+        else:
+            bonds = [b for b in all_bonds if b.get("source") in ("scheduled_job", "carried_forward", "BBG")]
+
+        if not bonds:
+            return {
+                "portfolio_id": portfolio_id,
+                "date": date,
+                "bonds": [],
+                "count": 0,
+                "summary": {"total": 0, "matched": 0, "drifted": 0, "desc_mismatches": 0},
+            }
+
+        # 2. Recalculate bonds via GA10 v4 gateway — batched concurrently
+        BATCH_SIZE = 5
+
+        async def calc_one(stored_bond):
+            isin = stored_bond["isin"]
+            price = stored_bond.get("price")
+            if not price:
+                return None
+            try:
+                resp = await client.post(
+                    f"{gw_url}/api/{gw_version}/bond/analysis",
+                    json={"isin": isin, "price": price, "settlement_date": date},
+                    timeout=20,
+                )
+                if resp.status_code == 200:
+                    return {"isin": isin, "analytics": resp.json().get("analytics", {})}
+                return {"isin": isin, "error": f"GA10 {gw_version} {resp.status_code}"}
+            except Exception as e:
+                return {"isin": isin, "error": str(e)}
+
+        fresh_results = {}
+        for i in range(0, len(bonds), BATCH_SIZE):
+            batch = bonds[i:i + BATCH_SIZE]
+            batch_results = await asyncio.gather(*[calc_one(b) for b in batch])
+            for r in batch_results:
+                if r:
+                    fresh_results[r["isin"]] = r
+
+        # 3. Compare stored vs fresh + description recon
+        results = []
+        drifted = 0
+        desc_mismatches = 0
+
+        for stored in bonds:
+            isin = stored["isin"]
+            price = stored.get("price")
+            if not price:
+                continue
+
+            s_ytm = stored.get("yield_to_maturity") or 0
+            s_dur = stored.get("modified_duration") or 0
+            s_spr = stored.get("spread") or 0
+            s_accrued = stored.get("accrued_interest") or 0
+            source = stored.get("source", "unknown")
+
+            # Description recon: stored vs bond_identity
+            stored_desc = stored.get("description")
+            if not stored_desc:
+                conv = stored.get("conventions") or {}
+                stored_desc = conv.get("description")
+            identity_desc = identity_map.get(isin, {}).get("branded_description")
+            desc_match = True
+            if stored_desc and identity_desc and stored_desc.strip() != identity_desc.strip():
+                desc_match = False
+                desc_mismatches += 1
+
+            fresh = fresh_results.get(isin, {})
+            if fresh.get("error"):
+                results.append({
+                    "isin": isin, "source": source, "price": price,
+                    "description": {"stored": stored_desc, "identity": identity_desc, "match": desc_match},
+                    "error": fresh["error"],
+                })
+                continue
+
+            a = fresh.get("analytics", {})
+            f_ytm = a.get("ytm") or a.get("yield_to_maturity") or 0
+            f_dur = a.get("duration") or a.get("modified_duration") or 0
+            f_spr = a.get("spread") or a.get("z_spread") or 0
+            f_accrued = a.get("accrued_interest") or 0
+
+            d_ytm_bps = round((s_ytm - f_ytm) * 100, 1)
+            d_dur = round(s_dur - f_dur, 3)
+            d_spr = round(s_spr - f_spr, 1)
+            d_accrued = round(s_accrued - f_accrued, 4)
+
+            has_drift = abs(d_ytm_bps) > 5 or abs(d_dur) > 0.1 or abs(d_spr) > 10
+            if has_drift:
+                drifted += 1
+
+            results.append({
+                "isin": isin,
+                "description": {
+                    "stored": stored_desc,
+                    "identity": identity_desc,
+                    "match": desc_match,
+                },
+                "source": source,
+                "price": price,
+                "stored": {
+                    "ytm": round(s_ytm, 4),
+                    "duration": round(s_dur, 3),
+                    "spread": round(s_spr, 1),
+                    "accrued": round(s_accrued, 4),
+                },
+                "fresh": {
+                    "ytm": round(f_ytm, 4),
+                    "duration": round(f_dur, 3),
+                    "spread": round(f_spr, 1),
+                    "accrued": round(f_accrued, 4),
+                },
+                "diff": {
+                    "ytm_bps": d_ytm_bps,
+                    "duration": d_dur,
+                    "spread": d_spr,
+                    "accrued": d_accrued,
+                },
+                "drift": has_drift,
+            })
+
+        # Sort: drifted bonds first, then desc mismatches, then by ISIN
+        results.sort(key=lambda r: (
+            not r.get("drift", False),
+            r.get("description", {}).get("match", True),
+            r["isin"],
+        ))
+
+        return {
+            "portfolio_id": portfolio_id,
+            "date": date,
+            "bonds": results,
+            "count": len(results),
+            "summary": {
+                "total": len(results),
+                "matched": len(results) - drifted,
+                "drifted": drifted,
+                "desc_mismatches": desc_mismatches,
+                "engine": {"stored": "v3", "fresh": gw_version},
+                "thresholds": {"ytm_bps": 5, "duration": 0.1, "spread_bps": 10},
+            },
+        }
 
 
 @app.post("/backfill/coupon-maturity")
