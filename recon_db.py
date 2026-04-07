@@ -183,17 +183,19 @@ async def sync_bond_data(isins: list[str] = None) -> dict:
 
     logger.info(f"Bond data sync complete: {counts}")
 
-    # After syncing reference data, retrigger GA10 recalc for all existing
-    # (portfolio, date) pairs. This picks up any convention changes (coupon,
-    # maturity, day_count) that would affect accrued/yield/duration.
+    # After syncing reference data:
+    # 1. Compute accrued directly (no GA10 needed — uses bond_reference conventions)
+    # 2. Trigger GA10 recalc for yield/duration/spread (still needs QuantLib)
     try:
-        from recon_engine import recalc_all_existing
+        from recon_engine import compute_accrued_for_all, recalc_all_existing
         import asyncio
+        asyncio.create_task(compute_accrued_for_all())
         asyncio.create_task(recalc_all_existing())
-        counts["recalc_triggered"] = True
+        counts["accrued_calc_triggered"] = True
+        counts["ga10_recalc_triggered"] = True
     except Exception as e:
-        logger.warning(f"Post-sync recalc trigger failed: {e}")
-        counts["recalc_triggered"] = False
+        logger.warning(f"Post-sync calc trigger failed: {e}")
+        counts["accrued_calc_triggered"] = False
 
     return counts
 

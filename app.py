@@ -443,6 +443,14 @@ async def trigger_recalc_all():
     return result
 
 
+@app.post("/recalc/accrued")
+async def trigger_accrued_calc():
+    """Compute accrued directly from bond_reference for all bonds. No GA10 needed."""
+    from recon_engine import compute_accrued_for_all
+    result = await compute_accrued_for_all()
+    return result
+
+
 @app.post("/backfill/coupon-maturity")
 async def trigger_backfill(x_admin_key: str = Header(None, alias="X-Admin-Key")):
     """Manually trigger the coupon/maturity backfill. Admin only."""

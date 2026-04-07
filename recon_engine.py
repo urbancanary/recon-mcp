@@ -282,6 +282,129 @@ async def _store_admin_prices_to_bond_data(admin_bonds: list[dict], price_date: 
         logger.warning(f"Admin prices → bond_analytics_dated error: {e}")
 
 
+# ── Direct accrued computation (no GA10 dependency) ──────────────────────
+
+async def compute_accrued_for_all() -> dict:
+    """Compute accrued interest directly from bond_reference for every
+    (portfolio, date, isin) tuple in recon_bbg + recon_admin.
+
+    No GA10 call needed. Uses coupon, maturity, day_count, frequency
+    from local_bond_reference. Stores results in athena_bbg / athena_admin.
+
+    Called after sync_bond_data to pick up convention changes.
+    """
+    from accrued_calc import compute_accrued_multi
+    from recon_db import SUPABASE_URL, _headers, store_athena_bbg, _upsert
+
+    # Fetch bond reference data (coupon, maturity, day_count)
+    async with httpx.AsyncClient(timeout=15) as client:
+        ref_resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/local_bond_reference",
+            headers=_headers(),
+            params={"select": "isin,coupon,maturity_date,day_count"},
+        )
+        refs = {r["isin"]: r for r in (ref_resp.json() if ref_resp.status_code == 200 else [])}
+
+        # Fetch all BBG rows (portfolio, date, isin, par)
+        bbg_resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/recon_bbg",
+            headers=_headers(),
+            params={"select": "portfolio_id,date,isin,par", "limit": "5000"},
+        )
+        bbg_rows = bbg_resp.json() if bbg_resp.status_code == 200 else []
+
+        # Fetch all admin rows
+        admin_resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/recon_admin",
+            headers=_headers(),
+            params={"select": "portfolio_id,date,isin,par", "limit": "5000"},
+        )
+        admin_rows = admin_resp.json() if admin_resp.status_code == 200 else []
+
+    from datetime import date as _date
+
+    def _compute_for_rows(rows: list[dict]) -> list[dict]:
+        results = []
+        for r in rows:
+            ref = refs.get(r["isin"])
+            par = float(r["par"]) if r.get("par") else None
+            if not ref or ref.get("coupon") is None or not ref.get("maturity_date") or not par:
+                continue
+
+            try:
+                maturity = _date.fromisoformat(str(ref["maturity_date"]))
+                val_date = _date.fromisoformat(str(r["date"]))
+
+                # Infer frequency from accrual pattern
+                # Default semi-annual; if day_count suggests annual or bond is CNY, try annual
+                freq = "Semiannual"
+                # Simple heuristic: if maturity month matches issue pattern for annual bonds
+                # This is imperfect — should store frequency in bond_reference
+                # For now, check if day_count is ACT/365 (common for annual CNY bonds)
+                dc = ref.get("day_count") or "30/360"
+                if dc.upper() in ("ACT/365", "ACTUAL/365"):
+                    freq = "Annual"
+
+                multi = compute_accrued_multi(
+                    coupon=float(ref["coupon"]),
+                    maturity_date=maturity,
+                    par=par,
+                    valuation_date=val_date,
+                    frequency=freq,
+                    day_count=dc,
+                )
+
+                results.append({
+                    "portfolio_id": r["portfolio_id"],
+                    "date": str(r["date"]),
+                    "isin": r["isin"],
+                    "par": par,
+                    "source_price": None,
+                    "accrued_t0": multi["t0"],
+                    "accrued_c1": multi["c1"],
+                    "accrued_t1": multi["t1"],
+                    "accrued_c2": multi["c2"],
+                    "accrued_c3": multi["c3"],
+                })
+            except Exception as e:
+                logger.warning(f"Accrued calc failed for {r['isin']} on {r['date']}: {e}")
+                continue
+
+        return results
+
+    # Compute for BBG rows → store in athena_bbg
+    bbg_results = _compute_for_rows(bbg_rows)
+    bbg_stored = 0
+    if bbg_results:
+        # Group by (portfolio, date) for batch upsert
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for r in bbg_results:
+            groups[(r["portfolio_id"], r["date"])].append(r)
+        for (pid, dt), batch in groups.items():
+            bbg_stored += await store_athena_bbg(pid, dt, batch)
+
+    # Compute for admin rows → store in athena_admin
+    admin_results = _compute_for_rows(admin_rows)
+    admin_stored = 0
+    if admin_results:
+        admin_upsert = [{
+            "portfolio_id": r["portfolio_id"],
+            "date": r["date"],
+            "isin": r["isin"],
+            "par": r["par"],
+            "accrued_t0": r["accrued_t0"],
+            "accrued_c1": r["accrued_c1"],
+            "accrued_t1": r["accrued_t1"],
+            "accrued_c2": r["accrued_c2"],
+            "accrued_c3": r["accrued_c3"],
+        } for r in admin_results]
+        admin_stored = await _upsert("athena_admin", admin_upsert, "portfolio_id,date,isin")
+
+    logger.info(f"Direct accrued calc: {bbg_stored} athena_bbg + {admin_stored} athena_admin rows")
+    return {"athena_bbg": bbg_stored, "athena_admin": admin_stored}
+
+
 # ── GA10 orchestration ──────────────────────────────────────────────────────
 
 async def recalc_all_existing() -> dict:
