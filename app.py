@@ -653,10 +653,30 @@ async def recalc_single_bond(isin: str, date: str, portfolio_id: str = "wnbf"):
         d0 = datetime.strptime(date, "%Y-%m-%d")
         c1_date = (d0 + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        # Call gateway for T+0 and C+1
+        # Fetch conventions from bond_reference directly (not gateway cache)
+        from recon_db import BOND_DATA_URL, _bond_data_headers
+        ref_resp = await client.get(
+            f"{BOND_DATA_URL}/rest/v1/bond_reference",
+            headers=_bond_data_headers(),
+            params={"isin": f"eq.{isin}", "select": "coupon,maturity_date,day_count,frequency,issue_date,accrual_date"},
+        )
+        overrides = {}
+        if ref_resp.status_code == 200:
+            refs = ref_resp.json()
+            if refs:
+                r = refs[0]
+                if r.get("coupon") is not None: overrides["coupon"] = float(r["coupon"])
+                if r.get("maturity_date"): overrides["maturity_date"] = str(r["maturity_date"])
+                if r.get("day_count"): overrides["day_count"] = r["day_count"]
+                if r.get("frequency"): overrides["frequency"] = r["frequency"]
+                if r.get("issue_date"): overrides["issue_date"] = str(r["issue_date"])
+                if r.get("accrual_date"): overrides["first_coupon_end"] = str(r["accrual_date"])
+
+        # Call gateway for T+0 and C+1 with explicit overrides
         async def call_gw(settle):
             resp = await client.post(f"{gw_url}/api/v3/bond/analysis", json={
                 "isin": isin, "price": price, "settlement_date": settle,
+                "overrides": overrides if overrides else None,
             })
             if resp.status_code == 200:
                 return resp.json().get("analytics", {})
