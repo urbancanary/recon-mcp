@@ -18,6 +18,7 @@ from recon_db import (
     get_recon_status,
     backfill_coupon_maturity,
     sync_bond_data,
+    sync_orca_holdings,
 )
 from recon_engine import (
     process_bbg_upload,
@@ -47,6 +48,12 @@ async def _startup_backfill():
         sync_result = await sync_bond_data()
         _backfill_status["bond_data_sync"] = sync_result
         logger.info("Bond data sync complete: %s", sync_result)
+
+        # Sync Orca holdings (par amounts) for all portfolios
+        for pid in ("wnbf", "gcrif"):
+            orca_result = await sync_orca_holdings(pid)
+            _backfill_status[f"orca_holdings_{pid}"] = orca_result
+            logger.info("Orca holdings sync (%s): %s", pid, orca_result)
 
         bbg_result = await backfill_coupon_maturity("recon_bbg")
         maia_result = await backfill_coupon_maturity("recon_maia")
@@ -671,6 +678,8 @@ async def recalc_single_bond(isin: str, date: str, portfolio_id: str = "wnbf"):
                 if r.get("frequency"): overrides["frequency"] = r["frequency"]
                 if r.get("issue_date"): overrides["issue_date"] = str(r["issue_date"])
                 if r.get("accrual_date"): overrides["first_coupon_end"] = str(r["accrual_date"])
+                if r.get("calendar"): overrides["calendar"] = r["calendar"]
+                if r.get("business_convention"): overrides["business_convention"] = r["business_convention"]
 
         # Call gateway for T+0 and C+1 with explicit overrides
         async def call_gw(settle):
