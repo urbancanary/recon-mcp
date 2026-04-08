@@ -677,7 +677,13 @@ async def recalc_single_bond(isin: str, date: str, portfolio_id: str = "wnbf"):
                 if r.get("day_count"): overrides["day_count"] = r["day_count"]
                 if r.get("frequency"): overrides["frequency"] = r["frequency"]
                 if r.get("issue_date"): overrides["issue_date"] = str(r["issue_date"])
-                if r.get("accrual_date"): overrides["first_coupon_end"] = str(r["accrual_date"])
+                # Only pass first_coupon_end when it differs from issue_date (genuine stub period).
+                # If accrual_date == issue_date, GA10 treats it as an immediate coupon at issue
+                # and corrupts the schedule into sub-annual periods.
+                accrual = r.get("accrual_date")
+                issue = r.get("issue_date")
+                if accrual and accrual != issue:
+                    overrides["first_coupon_end"] = str(accrual)
                 if r.get("calendar"): overrides["calendar"] = r["calendar"]
                 if r.get("business_convention"): overrides["business_convention"] = r["business_convention"]
 
