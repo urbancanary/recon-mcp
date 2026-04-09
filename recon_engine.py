@@ -717,11 +717,13 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
     # Trigger GA10 recalc (fire-and-forget — can take minutes)
     asyncio.create_task(recalc_with_bbg_prices(price_bonds, bbg_date, pid, position_bonds))
 
+    # Enrich local bond tables with BBG-parsed maturity/coupon for NULL fields.
+    # Awaited so that local_bond_reference is up-to-date before the recalc fires.
+    await enrich_bond_data_from_bbg(maturity_date_bonds, coupon_bonds)
+
     # Sync bond data + Orca holdings for uploaded ISINs (fire-and-forget)
     asyncio.create_task(sync_bond_data(all_isins))
     asyncio.create_task(sync_orca_holdings(pid))
-    # Backfill local bond tables with BBG-parsed data for NULL fields (respects locked)
-    asyncio.create_task(enrich_bond_data_from_bbg(maturity_date_bonds, coupon_bonds))
 
     asyncio.create_task(alert_upload_success("bbg", pid, bbg_date, len(bbg_bonds), filename))
 
