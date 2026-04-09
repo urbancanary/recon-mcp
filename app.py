@@ -634,6 +634,37 @@ async def recalc_accrued(portfolio_id: str = "wnbf", date: str = None, force: bo
     return await _do_recalc_accrued(portfolio_id, date, force)
 
 
+@app.post("/enrich/from-recon-bbg")
+async def enrich_from_recon_bbg(portfolio_id: str = None):
+    """Backfill local_bond_identity and local_bond_reference with maturity dates
+    already stored in recon_bbg. Useful after deploying the enrichment feature —
+    no need to re-upload files. Respects the locked flag on local_bond_reference."""
+    from recon_db import SUPABASE_URL, _headers, enrich_bond_data_from_bbg
+    import httpx
+
+    params = {"select": "isin,maturity_date", "maturity_date": "not.is.null", "limit": "5000"}
+    if portfolio_id:
+        params["portfolio_id"] = f"eq.{portfolio_id}"
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(f"{SUPABASE_URL}/rest/v1/recon_bbg", headers=_headers(), params=params)
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"recon_bbg fetch failed: {resp.status_code}")
+
+    # Deduplicate: use the most recently correct maturity per ISIN (they're consistent across dates)
+    maturity_date_bonds = {}
+    for r in resp.json():
+        isin = r.get("isin")
+        mat = r.get("maturity_date")
+        if isin and mat:
+            maturity_date_bonds[isin] = mat
+
+    result = await enrich_bond_data_from_bbg(maturity_date_bonds, coupon_bonds={})
+    result["source_isins"] = len(maturity_date_bonds)
+    return result
+
+
 @app.post("/recalc/all")
 async def trigger_recalc_all():
     """Manually trigger GA10 recalc for all (portfolio, date) pairs in recon_bbg."""
