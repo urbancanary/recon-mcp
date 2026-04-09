@@ -470,6 +470,47 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
     from datetime import datetime, timedelta
     from recon_db import SUPABASE_URL, _headers, _upsert
 
+    def _accrued_at(settle: "datetime", coupon: float, freq: int, mat: "datetime",
+                    coup_months: list, coup_day: int, day_count: str, par: float) -> float:
+        """Compute accrued interest for a single settlement date."""
+        # Find last coupon date before this settlement
+        last_coupon = None
+        for y in [settle.year, settle.year - 1]:
+            for m in sorted(coup_months, reverse=True):
+                try:
+                    cd = datetime(y, m, coup_day)
+                except ValueError:
+                    cd = datetime(y, m, 28)
+                if cd < settle:
+                    if last_coupon is None or cd > last_coupon:
+                        last_coupon = cd
+                    break
+        if not last_coupon:
+            return 0.0
+
+        if "30" in day_count:
+            d1_day = min(last_coupon.day, 30)
+            d2_day = min(settle.day, 30) if d1_day == 30 else settle.day
+            days = (settle.year - last_coupon.year) * 360 + (settle.month - last_coupon.month) * 30 + (d2_day - d1_day)
+            accrued_per_100 = coupon / freq * days / (360 / freq)
+        else:
+            actual_days = (settle - last_coupon).days
+            next_coupon = None
+            for m in sorted(coup_months):
+                try:
+                    nc = datetime(last_coupon.year if m > last_coupon.month else last_coupon.year + 1, m, coup_day)
+                except ValueError:
+                    nc = datetime(last_coupon.year if m > last_coupon.month else last_coupon.year + 1, m, 28)
+                if nc > last_coupon:
+                    next_coupon = nc
+                    break
+            if not next_coupon:
+                next_coupon = last_coupon + timedelta(days=182)
+            period_days = (next_coupon - last_coupon).days
+            accrued_per_100 = coupon / freq * actual_days / period_days
+
+        return round(accrued_per_100 * par / 100, 6)
+
     async with httpx.AsyncClient(timeout=15) as client:
         # 1. Fetch all sources in parallel
         bbg_task = client.get(f"{SUPABASE_URL}/rest/v1/recon_bbg", headers=_headers(), params={
@@ -498,6 +539,7 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
         holdings_map = {r["isin"]: float(r["par_amount"]) for r in (holdings_resp.json() if holdings_resp.status_code == 200 else []) if r.get("par_amount")}
 
         # 2. Find bonds needing recalc
+        trade_date = datetime.strptime(date, "%Y-%m-%d")
         needs_recalc = []
         for isin, bbg in bbg_bonds.items():
             if force:
@@ -514,8 +556,7 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
         if not needs_recalc:
             return {"recalculated": 0, "message": "All bonds already match BBG"}
 
-        # 3. Compute accrued locally using 30/360 conventions
-        settle_date = datetime.strptime(date, "%Y-%m-%d") + timedelta(days=1)  # C+1
+        # 3. Compute accrued at all settlement offsets (T+0, C+1/T+1, C+2, C+3)
         updated_rows = []
         skipped = []
 
@@ -543,66 +584,21 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
                 skipped.append({"isin": isin, "reason": "no price"})
                 continue
 
-            # Determine coupon frequency (semi-annual default) and last coupon date
             mat = datetime.strptime(maturity[:10], "%Y-%m-%d")
             freq = 2  # semi-annual
-
-            # Find last coupon date before settlement
-            # Coupon months: mat.month and mat.month +/- 6
             coup_months = sorted(set([(mat.month - 1) % 12 + 1, ((mat.month + 5) % 12) + 1]))
-            coup_day = min(mat.day, 28)  # safe day
+            coup_day = min(mat.day, 28)
 
-            last_coupon = None
-            for y in [settle_date.year, settle_date.year - 1]:
-                for m in sorted(coup_months, reverse=True):
-                    try:
-                        cd = datetime(y, m, coup_day)
-                    except ValueError:
-                        cd = datetime(y, m, 28)
-                    if cd < settle_date:
-                        if last_coupon is None or cd > last_coupon:
-                            last_coupon = cd
-                        break
-
-            if not last_coupon:
-                skipped.append({"isin": isin, "reason": "could not determine last coupon date"})
-                continue
-
-            # 30/360 day count
-            if "30" in day_count or day_count is None:
-                d1_day = min(last_coupon.day, 30)
-                d2_day = min(settle_date.day, 30) if d1_day == 30 else settle_date.day
-                days_360 = (settle_date.year - last_coupon.year) * 360 + (settle_date.month - last_coupon.month) * 30 + (d2_day - d1_day)
-                accrued_per_100 = coupon / freq * days_360 / (360 / freq)
-            else:
-                # ACT/ACT fallback — count actual days
-                actual_days = (settle_date - last_coupon).days
-                # Find next coupon for period length
-                next_coupon = None
-                for m in sorted(coup_months):
-                    try:
-                        nc = datetime(last_coupon.year if m > last_coupon.month else last_coupon.year + 1, m, coup_day)
-                    except ValueError:
-                        nc = datetime(last_coupon.year if m > last_coupon.month else last_coupon.year + 1, m, 28)
-                    if nc > last_coupon:
-                        next_coupon = nc
-                        break
-                if not next_coupon:
-                    next_coupon = last_coupon + timedelta(days=182)
-                period_days = (next_coupon - last_coupon).days
-                accrued_per_100 = coupon / freq * actual_days / period_days
-
-            accrued_c1 = accrued_per_100 * par / 100
-
+            args = (coupon, freq, mat, coup_months, coup_day, day_count, par)
             updated_rows.append({
                 "isin": isin,
                 "par": par,
                 "source_price": price,
-                "accrued_t0": None,
-                "accrued_c1": round(accrued_c1, 6),
-                "accrued_t1": None,
-                "accrued_c2": None,
-                "accrued_c3": None,
+                "accrued_t0": _accrued_at(trade_date,            *args),
+                "accrued_c1": _accrued_at(trade_date + timedelta(days=1), *args),
+                "accrued_t1": _accrued_at(trade_date + timedelta(days=1), *args),
+                "accrued_c2": _accrued_at(trade_date + timedelta(days=2), *args),
+                "accrued_c3": _accrued_at(trade_date + timedelta(days=3), *args),
             })
 
         # 4. Upsert
