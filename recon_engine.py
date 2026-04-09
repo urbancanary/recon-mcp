@@ -641,6 +641,171 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
     return 0
 
 
+# ── Fast accrued recalc (local, no GA10 dependency) ─────────────────────────
+
+async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> dict:
+    """Compute accrued interest locally for all bonds in a BBG upload.
+
+    Uses local_bond_reference conventions (coupon, freq, day_count, accrual_date)
+    and orca_holdings for par. No GA10 dependency — runs in seconds.
+
+    Called automatically after every BBG upload (force=True) and also available
+    via the /recalc/accrued HTTP endpoint.
+    """
+    from datetime import datetime, timedelta
+    from recon_db import SUPABASE_URL, _headers, _upsert
+
+    def _last_coupon_before(settle, coup_months, coup_day):
+        last_coupon = None
+        for y in [settle.year, settle.year - 1]:
+            for m in sorted(coup_months, reverse=True):
+                try:
+                    cd = datetime(y, m, coup_day)
+                except ValueError:
+                    cd = datetime(y, m, 28)
+                if cd < settle:
+                    if last_coupon is None or cd > last_coupon:
+                        last_coupon = cd
+                    break
+        return last_coupon
+
+    def _accrued_at(settle, coupon, freq, mat, coup_months, coup_day, day_count, par,
+                    accrual_start=None):
+        last_coupon = _last_coupon_before(settle, coup_months, coup_day)
+        if last_coupon and accrual_start and last_coupon < accrual_start:
+            last_coupon = accrual_start
+        # Phantom coupon: coup_day arithmetic can land just after issue date — discard it
+        if last_coupon and accrual_start and last_coupon >= accrual_start and (last_coupon - accrual_start).days < 30:
+            last_coupon = accrual_start
+        if not last_coupon:
+            if accrual_start and accrual_start < settle:
+                last_coupon = accrual_start
+            else:
+                return 0.0
+
+        if "30" in day_count:
+            d1 = min(last_coupon.day, 30)
+            d2 = min(settle.day, 30) if d1 == 30 else settle.day
+            days = (settle.year - last_coupon.year) * 360 + (settle.month - last_coupon.month) * 30 + (d2 - d1)
+            per100 = coupon / freq * days / (360 / freq)
+        elif "365" in day_count:
+            per100 = coupon / freq * (settle - last_coupon).days / 365
+        else:
+            actual = (settle - last_coupon).days
+            nc = None
+            for m in sorted(coup_months):
+                try:
+                    nc = datetime(last_coupon.year if m > last_coupon.month else last_coupon.year + 1, m, coup_day)
+                except ValueError:
+                    nc = datetime(last_coupon.year if m > last_coupon.month else last_coupon.year + 1, m, 28)
+                if nc > last_coupon:
+                    break
+            period = (nc - last_coupon).days if nc else 182
+            per100 = coupon / freq * actual / period
+
+        return round(per100 * par / 100, 6)
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        bbg_resp, athena_resp, ref_resp, holdings_resp = await asyncio.gather(
+            client.get(f"{SUPABASE_URL}/rest/v1/recon_bbg", headers=_headers(), params={
+                "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
+                "select": "isin,par,price,accrued,maturity_date",
+            }),
+            client.get(f"{SUPABASE_URL}/rest/v1/athena_bbg", headers=_headers(), params={
+                "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
+                "select": "isin,par,accrued_c1,source_price",
+            }),
+            client.get(f"{SUPABASE_URL}/rest/v1/local_bond_reference", headers=_headers(), params={
+                "select": "isin,coupon,maturity_date,day_count,frequency,accrual_date",
+            }),
+            client.get(f"{SUPABASE_URL}/rest/v1/orca_holdings", headers=_headers(), params={
+                "portfolio_id": f"eq.{portfolio_id}", "select": "isin,par_amount",
+            }),
+        )
+
+    bbg_bonds   = {r["isin"]: r for r in (bbg_resp.json()      if bbg_resp.status_code      == 200 else [])}
+    athena_map  = {r["isin"]: r for r in (athena_resp.json()   if athena_resp.status_code   == 200 else [])}
+    ref_map     = {r["isin"]: r for r in (ref_resp.json()      if ref_resp.status_code      == 200 else [])}
+    holdings_map = {r["isin"]: float(r["par_amount"]) for r in (holdings_resp.json() if holdings_resp.status_code == 200 else []) if r.get("par_amount")}
+
+    trade_date = datetime.strptime(date, "%Y-%m-%d")
+    needs_recalc = list(bbg_bonds) if force else [
+        isin for isin, bbg in bbg_bonds.items()
+        if (athena_map.get(isin, {}).get("accrued_c1") is None
+            or bbg.get("accrued") is None
+            or (bbg["accrued"] != 0
+                and abs((athena_map[isin]["accrued_c1"] - bbg["accrued"]) / bbg["accrued"]) > 0.0001))
+    ]
+
+    if not needs_recalc:
+        return {"recalculated": 0, "message": "All bonds already match BBG"}
+
+    updated_rows, skipped = [], []
+    for isin in needs_recalc:
+        ref    = ref_map.get(isin)
+        bbg    = bbg_bonds[isin]
+        athena = athena_map.get(isin, {})
+
+        if not ref or not ref.get("coupon") or not ref.get("maturity_date"):
+            skipped.append({"isin": isin, "reason": "missing reference data"})
+            continue
+
+        coupon    = float(ref["coupon"])
+        maturity  = bbg.get("maturity_date") or ref["maturity_date"]
+        day_count = ref.get("day_count") or "30/360"
+        par = (holdings_map.get(isin)
+               or (float(bbg["par"]) if bbg.get("par") else None)
+               or (float(athena["par"]) if athena.get("par") else None))
+        if not par:
+            skipped.append({"isin": isin, "reason": "no par amount"}); continue
+
+        price = (float(bbg["price"]) if bbg.get("price")
+                 else (float(athena["source_price"]) if athena.get("source_price") else None))
+        if not price:
+            skipped.append({"isin": isin, "reason": "no price"}); continue
+
+        mat = datetime.strptime(maturity[:10], "%Y-%m-%d")
+        freq_str = (ref.get("frequency") or "").lower()
+        if freq_str in ("annual", "annually", "1"):
+            freq, coup_months = 1, [mat.month]
+        else:
+            freq = 2
+            coup_months = sorted(set([(mat.month - 1) % 12 + 1, ((mat.month + 5) % 12) + 1]))
+        coup_day = mat.day
+
+        accrual_date_str = ref.get("accrual_date")
+        accrual_start = datetime.strptime(accrual_date_str[:10], "%Y-%m-%d") if accrual_date_str else None
+
+        args = (coupon, freq, mat, coup_months, coup_day, day_count, par)
+        lc = _last_coupon_before(trade_date, coup_months, coup_day)
+        if lc and accrual_start and lc < accrual_start:
+            lc = accrual_start
+        if lc and accrual_start and lc >= accrual_start and (lc - accrual_start).days < 30:
+            lc = accrual_start
+        days_acc = (trade_date - lc).days if lc else None
+
+        updated_rows.append({
+            "isin": isin, "par": par, "source_price": price,
+            "day_count": day_count if "30" not in day_count else "30/360",
+            "days_accrued": days_acc,
+            "accrued_t0": _accrued_at(trade_date,                     *args, accrual_start=accrual_start),
+            "accrued_c1": _accrued_at(trade_date + timedelta(days=1), *args, accrual_start=accrual_start),
+            "accrued_t1": _accrued_at(trade_date + timedelta(days=1), *args, accrual_start=accrual_start),
+            "accrued_c2": _accrued_at(trade_date + timedelta(days=2), *args, accrual_start=accrual_start),
+            "accrued_c3": _accrued_at(trade_date + timedelta(days=3), *args, accrual_start=accrual_start),
+        })
+
+    if updated_rows:
+        await _upsert("athena_bbg",
+                      [{"portfolio_id": portfolio_id, "date": date, **r} for r in updated_rows],
+                      "portfolio_id,date,isin")
+
+    logger.info(f"recalc_accrued: {portfolio_id}/{date} → {len(updated_rows)} updated, {len(skipped)} skipped")
+    return {"recalculated": len(updated_rows), "checked": len(needs_recalc),
+            "skipped": skipped,
+            "bonds": [{"isin": r["isin"], "accrued_c1": r["accrued_c1"]} for r in updated_rows]}
+
+
 # ── High-level upload handlers ──────────────────────────────────────────────
 
 async def process_bbg_upload(file_bytes: bytes, filename: str,
@@ -747,6 +912,9 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
         eff_maturity_bonds=eff_maturity_bonds,
         first_coupon_bonds=first_coupon_bonds,
     )
+
+    # Fast accrued recalc — runs immediately after enrich so local_bond_reference is fresh
+    asyncio.create_task(recalc_accrued(pid, bbg_date, force=True))
 
     # Sync bond data + Orca holdings for uploaded ISINs (fire-and-forget)
     asyncio.create_task(sync_bond_data(all_isins))

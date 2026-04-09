@@ -24,6 +24,7 @@ from recon_engine import (
     process_bbg_upload,
     process_admin_upload,
     process_maia_upload,
+    recalc_accrued as _recalc_accrued,
 )
 from alerts import alert_upload_failed
 
@@ -496,211 +497,14 @@ async def trigger_sync():
     return result
 
 
-async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> dict:
-    """Core accrued recalc logic — callable internally or from the HTTP endpoint."""
-
-    import httpx
-    from datetime import datetime, timedelta
-    from recon_db import SUPABASE_URL, _headers, _upsert
-
-    def _last_coupon_before(settle: "datetime", coup_months: list, coup_day: int) -> "datetime | None":
-        """Find the most recent coupon date strictly before settle."""
-        last_coupon = None
-        for y in [settle.year, settle.year - 1]:
-            for m in sorted(coup_months, reverse=True):
-                try:
-                    cd = datetime(y, m, coup_day)
-                except ValueError:
-                    cd = datetime(y, m, 28)
-                if cd < settle:
-                    if last_coupon is None or cd > last_coupon:
-                        last_coupon = cd
-                    break
-        return last_coupon
-
-    def _accrued_at(settle: "datetime", coupon: float, freq: int, mat: "datetime",
-                    coup_months: list, coup_day: int, day_count: str, par: float,
-                    accrual_start: "datetime | None" = None) -> float:
-        """Compute accrued interest for a single settlement date."""
-        last_coupon = _last_coupon_before(settle, coup_months, coup_day)
-        # For bonds that haven't paid a first coupon, clamp to accrual_start
-        if last_coupon and accrual_start and last_coupon < accrual_start:
-            last_coupon = accrual_start
-        # Phantom coupon: coup_day rounding can create a date just after issue — discard it
-        if last_coupon and accrual_start and last_coupon >= accrual_start and (last_coupon - accrual_start).days < 30:
-            last_coupon = accrual_start
-        if not last_coupon:
-            if accrual_start and accrual_start < settle:
-                last_coupon = accrual_start
-            else:
-                return 0.0
-
-        if "30" in day_count:
-            d1_day = min(last_coupon.day, 30)
-            d2_day = min(settle.day, 30) if d1_day == 30 else settle.day
-            days = (settle.year - last_coupon.year) * 360 + (settle.month - last_coupon.month) * 30 + (d2_day - d1_day)
-            accrued_per_100 = coupon / freq * days / (360 / freq)
-        elif "365" in day_count:
-            actual_days = (settle - last_coupon).days
-            accrued_per_100 = coupon / freq * actual_days / 365
-        else:
-            actual_days = (settle - last_coupon).days
-            next_coupon = None
-            for m in sorted(coup_months):
-                try:
-                    nc = datetime(last_coupon.year if m > last_coupon.month else last_coupon.year + 1, m, coup_day)
-                except ValueError:
-                    nc = datetime(last_coupon.year if m > last_coupon.month else last_coupon.year + 1, m, 28)
-                if nc > last_coupon:
-                    next_coupon = nc
-                    break
-            if not next_coupon:
-                next_coupon = last_coupon + timedelta(days=182)
-            period_days = (next_coupon - last_coupon).days
-            accrued_per_100 = coupon / freq * actual_days / period_days
-
-        return round(accrued_per_100 * par / 100, 6)
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        # 1. Fetch all sources in parallel
-        bbg_task = client.get(f"{SUPABASE_URL}/rest/v1/recon_bbg", headers=_headers(), params={
-            "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
-            "select": "isin,par,price,accrued,maturity_date",
-        })
-        athena_task = client.get(f"{SUPABASE_URL}/rest/v1/athena_bbg", headers=_headers(), params={
-            "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
-            "select": "isin,par,accrued_c1,source_price",
-        })
-        ref_task = client.get(f"{SUPABASE_URL}/rest/v1/local_bond_reference", headers=_headers(), params={
-            "select": "isin,coupon,maturity_date,day_count,frequency,accrual_date",
-        })
-        holdings_task = client.get(f"{SUPABASE_URL}/rest/v1/orca_holdings", headers=_headers(), params={
-            "portfolio_id": f"eq.{portfolio_id}",
-            "select": "isin,par_amount",
-        })
-
-        bbg_resp, athena_resp, ref_resp, holdings_resp = await asyncio.gather(
-            bbg_task, athena_task, ref_task, holdings_task
-        )
-
-        bbg_bonds = {r["isin"]: r for r in (bbg_resp.json() if bbg_resp.status_code == 200 else [])}
-        athena_map = {r["isin"]: r for r in (athena_resp.json() if athena_resp.status_code == 200 else [])}
-        ref_map = {r["isin"]: r for r in (ref_resp.json() if ref_resp.status_code == 200 else [])}
-        holdings_map = {r["isin"]: float(r["par_amount"]) for r in (holdings_resp.json() if holdings_resp.status_code == 200 else []) if r.get("par_amount")}
-
-        # 2. Find bonds needing recalc
-        trade_date = datetime.strptime(date, "%Y-%m-%d")
-        needs_recalc = []
-        for isin, bbg in bbg_bonds.items():
-            if force:
-                needs_recalc.append(isin)
-                continue
-            athena = athena_map.get(isin, {})
-            c1 = athena.get("accrued_c1")
-            bbg_accrued = bbg.get("accrued")
-            if c1 is None or bbg_accrued is None:
-                needs_recalc.append(isin)
-            elif bbg_accrued != 0 and abs((c1 - bbg_accrued) / bbg_accrued) > 0.0001:
-                needs_recalc.append(isin)
-
-        if not needs_recalc:
-            return {"recalculated": 0, "message": "All bonds already match BBG"}
-
-        # 3. Compute accrued at all settlement offsets (T+0, C+1/T+1, C+2, C+3)
-        updated_rows = []
-        skipped = []
-
-        for isin in needs_recalc:
-            ref = ref_map.get(isin)
-            bbg = bbg_bonds[isin]
-            athena = athena_map.get(isin, {})
-
-            if not ref or not ref.get("coupon") or not ref.get("maturity_date"):
-                skipped.append({"isin": isin, "reason": "missing reference data"})
-                continue
-
-            coupon = float(ref["coupon"])
-            # Prefer BBG-parsed maturity (from Long Name, exact date) over CBonds which rounds to month-end
-            maturity = bbg.get("maturity_date") or ref["maturity_date"]
-            day_count = ref.get("day_count") or "30/360"
-
-            # Par priority: orca_holdings > bbg > athena_bbg
-            par = holdings_map.get(isin) or (float(bbg["par"]) if bbg.get("par") else None) or (float(athena["par"]) if athena.get("par") else None)
-            if not par:
-                skipped.append({"isin": isin, "reason": "no par amount"})
-                continue
-
-            price = float(bbg["price"]) if bbg.get("price") else (float(athena["source_price"]) if athena.get("source_price") else None)
-            if not price:
-                skipped.append({"isin": isin, "reason": "no price"})
-                continue
-
-            mat = datetime.strptime(maturity[:10], "%Y-%m-%d")
-            # Frequency: read from bond reference, default to semi-annual
-            frequency_str = (ref.get("frequency") or "").lower()
-            if frequency_str in ("annual", "annually", "1"):
-                freq = 1
-                coup_months = [mat.month]
-            else:
-                freq = 2
-                coup_months = sorted(set([(mat.month - 1) % 12 + 1, ((mat.month + 5) % 12) + 1]))
-            coup_day = mat.day
-
-            # For bonds that haven't paid a first coupon yet, accrual starts from accrual_date
-            accrual_date_str = ref.get("accrual_date")
-            accrual_start = datetime.strptime(accrual_date_str[:10], "%Y-%m-%d") if accrual_date_str else None
-
-            args = (coupon, freq, mat, coup_months, coup_day, day_count, par)
-            used_convention = day_count if "30" not in day_count else "30/360"
-            # Days since last coupon at T+0 — clamp to accrual_start for new bonds
-            lc = _last_coupon_before(trade_date, coup_months, coup_day)
-            if lc and accrual_start and lc < accrual_start:
-                lc = accrual_start
-            # Phantom coupon: coup_day rounding can create a date just after issue — discard it
-            if lc and accrual_start and lc >= accrual_start and (lc - accrual_start).days < 30:
-                lc = accrual_start
-            days_acc = (trade_date - lc).days if lc else None
-            updated_rows.append({
-                "isin": isin,
-                "par": par,
-                "source_price": price,
-                "day_count": used_convention,
-                "days_accrued": days_acc,
-                "accrued_t0": _accrued_at(trade_date,                      *args, accrual_start=accrual_start),
-                "accrued_c1": _accrued_at(trade_date + timedelta(days=1),  *args, accrual_start=accrual_start),
-                "accrued_t1": _accrued_at(trade_date + timedelta(days=1),  *args, accrual_start=accrual_start),
-                "accrued_c2": _accrued_at(trade_date + timedelta(days=2),  *args, accrual_start=accrual_start),
-                "accrued_c3": _accrued_at(trade_date + timedelta(days=3),  *args, accrual_start=accrual_start),
-            })
-
-        # 4. Upsert
-        if updated_rows:
-            upsert_rows = [{
-                "portfolio_id": portfolio_id,
-                "date": date,
-                **r,
-            } for r in updated_rows]
-            await _upsert("athena_bbg", upsert_rows, "portfolio_id,date,isin")
-
-        return {
-            "recalculated": len(updated_rows),
-            "checked": len(needs_recalc),
-            "skipped": skipped,
-            "bonds": [{"isin": r["isin"], "par": r["par"], "accrued_c1": r["accrued_c1"]} for r in updated_rows],
-        }
-
-
 @app.post("/recalc/accrued")
-async def recalc_accrued(portfolio_id: str = "wnbf", date: str = None, force: bool = False):
-    """Fast accrued-only recalc using local_bond_reference conventions and
-    orca_holdings for par. No GA10 dependency — computes 30/360 accrued directly.
-
-    Compares result vs BBG and only updates bonds that differ.
-    Pass force=true to recalc ALL bonds regardless of current match status.
+async def recalc_accrued_endpoint(portfolio_id: str = "wnbf", date: str = None, force: bool = False):
+    """Fast accrued-only recalc. Delegates to recon_engine.recalc_accrued.
+    Also fires automatically after every BBG upload (force=True).
     """
     if not date:
         raise HTTPException(status_code=400, detail="date parameter required")
-    return await _do_recalc_accrued(portfolio_id, date, force)
+    return await _recalc_accrued(portfolio_id, date, force)
 
 
 @app.post("/enrich/from-recon-bbg")
