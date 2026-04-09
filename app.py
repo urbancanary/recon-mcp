@@ -470,10 +470,8 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
     from datetime import datetime, timedelta
     from recon_db import SUPABASE_URL, _headers, _upsert
 
-    def _accrued_at(settle: "datetime", coupon: float, freq: int, mat: "datetime",
-                    coup_months: list, coup_day: int, day_count: str, par: float) -> float:
-        """Compute accrued interest for a single settlement date."""
-        # Find last coupon date before this settlement
+    def _last_coupon_before(settle: "datetime", coup_months: list, coup_day: int) -> "datetime | None":
+        """Find the most recent coupon date strictly before settle."""
         last_coupon = None
         for y in [settle.year, settle.year - 1]:
             for m in sorted(coup_months, reverse=True):
@@ -485,6 +483,12 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
                     if last_coupon is None or cd > last_coupon:
                         last_coupon = cd
                     break
+        return last_coupon
+
+    def _accrued_at(settle: "datetime", coupon: float, freq: int, mat: "datetime",
+                    coup_months: list, coup_day: int, day_count: str, par: float) -> float:
+        """Compute accrued interest for a single settlement date."""
+        last_coupon = _last_coupon_before(settle, coup_months, coup_day)
         if not last_coupon:
             return 0.0
 
@@ -592,11 +596,15 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
 
             args = (coupon, freq, mat, coup_months, coup_day, day_count, par)
             used_convention = day_count if "30" not in day_count else "30/360"
+            # Days since last coupon at T+0 (useful for debugging accrual)
+            lc = _last_coupon_before(trade_date, coup_months, coup_day)
+            days_acc = (trade_date - lc).days if lc else None
             updated_rows.append({
                 "isin": isin,
                 "par": par,
                 "source_price": price,
                 "day_count": used_convention,
+                "days_accrued": days_acc,
                 "accrued_t0": _accrued_at(trade_date,            *args),
                 "accrued_c1": _accrued_at(trade_date + timedelta(days=1), *args),
                 "accrued_t1": _accrued_at(trade_date + timedelta(days=1), *args),

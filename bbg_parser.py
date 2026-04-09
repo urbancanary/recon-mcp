@@ -330,6 +330,17 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
                 position_bonds = {k: v / 1000 for k, v in position_bonds.items()}
                 mv_bonds = {k: v / 1000 for k, v in mv_bonds.items()}
 
+        # Independent par scale detection — catches cases where accrued values are small
+        # (e.g. CNH portfolios after FX division) but par is still 1000x too large.
+        # A per-bond par > 1B is unrealistic for any normal fund position.
+        if position_bonds:
+            pos_vals = sorted(abs(v) for v in position_bonds.values())
+            median_pos = pos_vals[len(pos_vals) // 2]
+            if median_pos > 1_000_000_000:
+                logger.info("BBG par values oversized (median=%.0f), dividing par/mv by 1000", median_pos)
+                position_bonds = {k: v / 1000 for k, v in position_bonds.items()}
+                mv_bonds = {k: v / 1000 for k, v in mv_bonds.items()}
+
         # Get settle date from data if available
         settle_date = None
         if 'settle' in col_map:
