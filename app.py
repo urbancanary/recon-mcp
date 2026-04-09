@@ -1061,6 +1061,195 @@ async def athena_v_ga10(portfolio_id: str = "wnbf", date: str = None):
         }
 
 
+@app.post("/recalc/portfolio")
+async def recalc_portfolio(portfolio_id: str = "gcrif", date: str = None):
+    """
+    Batch recalc all bonds for a portfolio on a given date.
+
+    For each ISIN:
+      - Fetches BBG price + par from recon_bbg
+      - Fetches conventions from v_portfolio_bond_reference (bond_reference + bond_identity)
+      - Calls GA10 for 4 settlement dates: T+0, T+1, T+2, T+3 (= C+1, C+2, C+3)
+      - Stores accrued, ytm, ytw, ytal, duration + metadata (days_accrued,
+        last_coupon_date, accrual_convention, biz_convention) AS RETURNED BY GA10
+      - Upserts recon_calcs and athena_bbg, overwriting any existing row for
+        this portfolio/date/isin
+
+    Returns a grid of results — one row per ISIN.
+    """
+    import os
+    import httpx
+    from datetime import datetime as dt, timedelta
+    from recon_db import SUPABASE_URL, BOND_DATA_URL, _headers, _bond_data_headers, store_calcs, _upsert
+
+    if not date:
+        raise HTTPException(status_code=400, detail="date parameter required")
+
+    gw_url = os.environ.get("GA10_GATEWAY_URL", "https://ga10-gateway.urbancanary.workers.dev")
+    d0 = dt.strptime(date, "%Y-%m-%d").date()
+
+    # Settlement offsets: T+0 = same day, then +1, +2, +3 calendar days
+    offsets = {"t0": 0, "c1": 1, "t1": 1, "c2": 2, "t2": 2, "c3": 3, "t3": 3}
+    settle_dates = {k: (d0 + timedelta(days=v)).strftime("%Y-%m-%d") for k, v in offsets.items()}
+
+    async with httpx.AsyncClient(timeout=60) as client:
+
+        # 1. Get all ISINs + BBG prices + par for this portfolio/date
+        bbg_resp = await client.get(f"{SUPABASE_URL}/rest/v1/recon_bbg", headers=_headers(), params={
+            "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
+            "select": "isin,par,price",
+        })
+        bbg_rows = bbg_resp.json() if bbg_resp.status_code == 200 else []
+        if not bbg_rows:
+            return JSONResponse({"error": f"No BBG data for {portfolio_id} on {date}"}, status_code=404)
+
+        bbg_by_isin = {r["isin"]: r for r in bbg_rows}
+
+        # 2. Get conventions for all ISINs from v_portfolio_bond_reference
+        ref_resp = await client.get(
+            f"{BOND_DATA_URL}/rest/v1/v_portfolio_bond_reference",
+            headers=_bond_data_headers(),
+            params={
+                "portfolio_id": f"eq.{portfolio_id}",
+                "select": "isin,coupon,maturity_date,day_count,frequency,issue_date,accrual_date,calendar,business_convention",
+            },
+        )
+        ref_rows = ref_resp.json() if ref_resp.status_code == 200 else []
+        ref_by_isin = {r["isin"]: r for r in ref_rows}
+
+        def build_overrides(r):
+            ov = {}
+            if r.get("coupon") is not None: ov["coupon"] = float(r["coupon"])
+            if r.get("maturity_date"): ov["maturity_date"] = str(r["maturity_date"])
+            if r.get("day_count"): ov["day_count"] = r["day_count"]
+            if r.get("frequency"): ov["frequency"] = r["frequency"]
+            if r.get("issue_date"): ov["issue_date"] = str(r["issue_date"])
+            accrual = r.get("accrual_date"); issue = r.get("issue_date")
+            if accrual and accrual != issue:
+                ov["first_coupon_end"] = str(accrual)
+            if r.get("calendar"): ov["calendar"] = r["calendar"]
+            if r.get("business_convention"): ov["business_convention"] = r["business_convention"]
+            return ov
+
+        def parse_ga10(resp_json):
+            """Extract metrics from GA10 response. Returns dict or None."""
+            if not resp_json:
+                return None
+            a = resp_json.get("analytics") or resp_json
+            if not a or a.get("error"):
+                return None
+            conv = a.get("conventions") or {}
+            return {
+                "accrued":      a.get("accrued_interest"),
+                "ytm":          a.get("ytm") or a.get("yield_to_maturity"),
+                "ytw":          a.get("ytw"),
+                "ytal":         a.get("ytal"),
+                "duration":     a.get("duration") or a.get("modified_duration"),
+                "duration_worst": a.get("duration_worst"),
+                "spread":       a.get("spread"),
+                "convexity":    a.get("convexity"),
+                "dv01":         a.get("pvbp") or a.get("dv01"),
+                "days_accrued": a.get("accrued_days"),
+                "last_coupon_date": a.get("last_coupon_date") or conv.get("last_coupon_date"),
+                "accrual_convention": conv.get("day_count") or a.get("day_count"),
+                "biz_convention": conv.get("business_day_convention") or a.get("business_convention"),
+                "frequency_used": conv.get("frequency") or a.get("frequency"),
+            }
+
+        async def call_ga10(isin, price, settle, overrides):
+            try:
+                resp = await client.post(f"{gw_url}/api/v3/bond/analysis", json={
+                    "isin": isin, "price": price, "settlement_date": settle,
+                    "overrides": overrides if overrides else None,
+                })
+                return parse_ga10(resp.json()) if resp.status_code == 200 else None
+            except Exception:
+                return None
+
+        # 3. Loop through each ISIN, call GA10 for 4 unique settlement dates concurrently
+        results = []
+        unique_dates = ["t0", "c1", "c2", "c3"]  # t1=c1, t2=c2, t3=c3
+
+        for isin, bbg in bbg_by_isin.items():
+            price = bbg.get("price")
+            par = float(bbg.get("par") or 0)
+            if not price:
+                continue
+            price = float(price)
+            overrides = build_overrides(ref_by_isin.get(isin, {}))
+
+            # Call GA10 for 4 settlement dates in parallel
+            ga10_results = await asyncio.gather(*[
+                call_ga10(isin, price, settle_dates[k], overrides)
+                for k in unique_dates
+            ])
+            r = dict(zip(unique_dates, ga10_results))
+
+            # t1=c1, t2=c2, t3=c3
+            r["t1"] = r["c1"]; r["t2"] = r["c2"]; r["t3"] = r["c3"]
+
+            # Build recon_calcs row — per-100 values
+            def v(key, field): return r[key][field] if r.get(key) and r[key] else None
+
+            calc = {
+                "isin": isin, "source_price": price,
+                "ga10_accrued":      v("t0", "accrued"),
+                "ga10_accrued_c1":   v("c1", "accrued"),
+                "ga10_accrued_t1":   v("t1", "accrued"),
+                "ga10_accrued_t2":   v("c2", "accrued"),
+                "ga10_accrued_t3":   v("c3", "accrued"),
+                "ga10_yield":        v("t0", "ytm"),
+                "ga10_yield_c1":     v("c1", "ytm"),
+                "ga10_yield_t1":     v("t1", "ytm"),
+                "ga10_yield_worst":  v("t0", "ytw"),
+                "ga10_duration":     v("t0", "duration"),
+                "ga10_duration_worst": v("t0", "duration_worst"),
+                "ga10_spread":       v("t0", "spread"),
+                "ga10_convexity":    v("t0", "convexity"),
+                "ga10_dv01":         v("t0", "dv01"),
+                # Metadata from GA10 response (not from DB — reflects what GA10 actually used)
+                "days_accrued_c1":        v("c1", "days_accrued"),
+                "last_coupon_date":        v("c1", "last_coupon_date"),
+                "accrual_convention_used": v("c1", "accrual_convention"),
+                "biz_convention_used":     v("c1", "biz_convention"),
+                "frequency_used":          v("c1", "frequency_used"),
+            }
+            await store_calcs(portfolio_id, date, [calc])
+
+            # Update athena_bbg with par-scaled accrued
+            if par:
+                mult = par / 100
+                await _upsert("athena_bbg", [{
+                    "portfolio_id": portfolio_id, "date": date, "isin": isin,
+                    "par": par, "source_price": price,
+                    "accrued_t0": v("t0", "accrued") * mult if v("t0", "accrued") else None,
+                    "accrued_c1": v("c1", "accrued") * mult if v("c1", "accrued") else None,
+                    "accrued_t1": v("t1", "accrued") * mult if v("t1", "accrued") else None,
+                    "accrued_c2": v("c2", "accrued") * mult if v("c2", "accrued") else None,
+                    "accrued_c3": v("c3", "accrued") * mult if v("c3", "accrued") else None,
+                }], "portfolio_id,date,isin")
+
+            # Build result row for the response grid
+            results.append({
+                "isin": isin,
+                "price": price,
+                "par": par,
+                "overrides_sent": list(overrides.keys()),
+                "t0":  r["t0"],
+                "c1":  r["c1"],
+                "c2":  r["c2"],
+                "c3":  r["c3"],
+            })
+
+    return {
+        "portfolio_id": portfolio_id,
+        "date": date,
+        "bonds_processed": len(results),
+        "settlement_dates": {k: settle_dates[k] for k in unique_dates},
+        "results": results,
+    }
+
+
 @app.post("/backfill/coupon-maturity")
 async def trigger_backfill(x_admin_key: str = Header(None, alias="X-Admin-Key")):
     """Manually trigger the coupon/maturity backfill. Admin only."""
