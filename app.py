@@ -62,9 +62,42 @@ async def _startup_backfill():
             "recon_maia": maia_result,
         }
         logger.info("Startup backfill complete: %s", _backfill_status)
+
+        # Auto-recalc any athena_bbg rows missing days_accrued (e.g. after a code deploy
+        # that added the column, or after a failed recalc). Runs quietly in background.
+        asyncio.create_task(_backfill_missing_days_accrued())
+
     except Exception as e:
         logger.error(f"Startup backfill failed: {e}")
         _backfill_status["coupon_maturity"] = {"error": str(e)}
+
+
+async def _backfill_missing_days_accrued():
+    """Find all (portfolio_id, date) pairs in athena_bbg with NULL days_accrued
+    and trigger a force recalc for each. Runs once on startup."""
+    import httpx
+    from recon_db import SUPABASE_URL, _headers
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/athena_bbg",
+                headers=_headers(),
+                params={"days_accrued": "is.null", "select": "portfolio_id,date", "limit": "500"},
+            )
+        if resp.status_code != 200:
+            return
+        rows = resp.json()
+        # Deduplicate (portfolio_id, date) pairs
+        pairs = list({(r["portfolio_id"], r["date"]) for r in rows if r.get("portfolio_id") and r.get("date")})
+        if not pairs:
+            logger.info("Startup: all athena_bbg rows have days_accrued populated")
+            return
+        logger.info("Startup: recalculating days_accrued for %d date(s): %s", len(pairs), pairs)
+        for pid, date in pairs:
+            await _do_recalc_accrued(pid, date, force=True)
+        logger.info("Startup: days_accrued backfill complete")
+    except Exception as e:
+        logger.warning("Startup days_accrued backfill failed: %s", e)
 
 
 @app.on_event("startup")
