@@ -154,9 +154,18 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
             # Position / Quantity / Par
             elif 'position' not in col_map and (
                 upper in ('POSITION', 'QUANTITY', 'QTY', 'PAR', 'FACE', 'NOMINAL',
-                          'PAR AMOUNT', 'FACE AMOUNT', 'NOTIONAL')
+                          'PAR AMOUNT', 'FACE AMOUNT', 'NOTIONAL', 'POS')
             ):
                 col_map['position'] = col
+            # Issue Date
+            elif 'issue_date' not in col_map and (
+                upper in ('ISS DT', 'ISSUE DATE', 'ISSUE DT', 'ISSUANCE DATE', 'ISS DATE',
+                          'DATED DATE', 'ISSUE_DATE', 'ISS_DT')
+                or (upper.startswith('ISS') and 'DT' in upper and len(upper) <= 10)
+            ):
+                col_map['issue_date'] = col
+
+        logger.info("BBG columns detected: %s → col_map: %s", [str(c) for c in df.columns], col_map)
 
         if 'isin' not in col_map:
             raise ValueError(f"No ISIN column found. Columns: {list(df.columns)}")
@@ -174,14 +183,16 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
         oad_col = col_map.get('mod_dur') or col_map.get('oad')  # Prefer mod dur over OAD
         mv_col = col_map.get('mv')
         position_col = col_map.get('position')
+        issue_date_col = col_map.get('issue_date')
         bonds = {}
         yield_bonds = {}    # Primary yield (YTM preferred, YTW fallback)
         ytm_bonds = {}      # YTM specifically
         ytw_bonds = {}      # YTW specifically
         price_bonds = {}
         oad_bonds = {}
-        mv_bonds = {}       # Market value per bond
-        position_bonds = {} # Position/par per bond
+        mv_bonds = {}         # Market value per bond
+        position_bonds = {}   # Position/par per bond
+        issue_date_bonds = {} # Issue date per bond
         raw_values = []
         for _, row in df.iterrows():
             isin = str(row[isin_col]).strip()
@@ -266,6 +277,20 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
                 except (ValueError, TypeError):
                     pass
 
+            # Extract Issue Date if column present
+            if issue_date_col is not None:
+                try:
+                    iss_dt = row[issue_date_col]
+                    if pd.notna(iss_dt):
+                        if hasattr(iss_dt, 'strftime'):
+                            issue_date_bonds[isin] = iss_dt.strftime('%Y-%m-%d')
+                        else:
+                            s = str(iss_dt).strip()
+                            if s and s != 'nan':
+                                issue_date_bonds[isin] = s
+                except (ValueError, TypeError):
+                    pass
+
         # BBG PORT exports store values in thousands — detect and correct
         if raw_values:
             median_val = sorted(raw_values)[len(raw_values) // 2]
@@ -315,8 +340,8 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
         bbg_securities_mv = sum(mv_bonds.values()) if mv_bonds else None
 
         yield_source = 'YTM' if col_map.get('ytm') else ('YTW' if col_map.get('ytw') else 'none')
-        logger.info("BBG export parsed: %d bonds, as_of=%s, settle=%s, base_ccy=%s, yield_col=%s (%d bonds), price_bonds=%d, oad_bonds=%d, mv_bonds=%d",
-                    len(bonds), as_of_date, settle_date, base_currency, yield_source, len(yield_bonds), len(price_bonds), len(oad_bonds), len(mv_bonds))
+        logger.info("BBG export parsed: %d bonds, as_of=%s, settle=%s, base_ccy=%s, yield_col=%s (%d bonds), price_bonds=%d, oad_bonds=%d, mv_bonds=%d, issue_dates=%d",
+                    len(bonds), as_of_date, settle_date, base_currency, yield_source, len(yield_bonds), len(price_bonds), len(oad_bonds), len(mv_bonds), len(issue_date_bonds))
 
         return {
             "type": "bbg",
@@ -328,6 +353,7 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
             "oad_bonds": oad_bonds,
             "mv_bonds": mv_bonds,
             "position_bonds": position_bonds,
+            "issue_date_bonds": issue_date_bonds,
             "bbg_securities_mv": bbg_securities_mv,
             "bbg_total_mv": total_mv_with_cash,
             "count": len(bonds),

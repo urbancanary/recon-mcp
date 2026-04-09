@@ -16,7 +16,8 @@ import httpx
 
 from recon_db import (
     store_bbg, store_admin, store_maia, store_calcs, store_athena_bbg,
-    store_raw_upload, lookup_bond_reference, sync_bond_data, SUPABASE_URL, _headers,
+    store_raw_upload, lookup_bond_reference, sync_bond_data, sync_orca_holdings,
+    SUPABASE_URL, _headers,
 )
 from alerts import (
     alert_ga10_partial_failure, alert_upload_failed,
@@ -676,6 +677,7 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
     oad_bonds = bbg_result.get("oad_bonds", {})
     mv_bonds = bbg_result.get("mv_bonds", {})
     position_bonds = bbg_result.get("position_bonds", {})
+    issue_date_bonds = bbg_result.get("issue_date_bonds", {})
     all_isins = list(set(list(price_bonds.keys()) + list(accrued_bonds.keys())))
 
     ref_by_isin = await lookup_bond_reference(all_isins)
@@ -695,6 +697,7 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
             "duration": oad_bonds.get(isin),
             "mv": mv_bonds.get(isin),
             "par": position_bonds.get(isin),
+            "issue_date": issue_date_bonds.get(isin),
         })
 
     # Store parsed data + raw file in parallel
@@ -710,8 +713,9 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
     # Trigger GA10 recalc (fire-and-forget — can take minutes)
     asyncio.create_task(recalc_with_bbg_prices(price_bonds, bbg_date, pid, position_bonds))
 
-    # Sync bond data for uploaded ISINs (fire-and-forget)
+    # Sync bond data + Orca holdings for uploaded ISINs (fire-and-forget)
     asyncio.create_task(sync_bond_data(all_isins))
+    asyncio.create_task(sync_orca_holdings(pid))
 
     asyncio.create_task(alert_upload_success("bbg", pid, bbg_date, len(bbg_bonds), filename))
 

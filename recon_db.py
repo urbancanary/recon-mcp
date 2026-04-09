@@ -95,6 +95,47 @@ async def lookup_bond_reference(isins: list[str]) -> dict[str, dict]:
     return {}
 
 
+# ── Sync: Orca holdings → orca_holdings table ────────────────────────────────
+# Recon views join orca_holdings for Athena Par (the actual holding, not BBG nominal).
+
+ORCA_MCP_URL = os.environ.get("ORCA_MCP_URL", "https://orca-mcp-production.up.railway.app")
+
+
+async def sync_orca_holdings(portfolio_id: str = "wnbf") -> dict:
+    """Fetch holdings from Orca and upsert into orca_holdings table."""
+    _ensure_key()
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(f"{ORCA_MCP_URL}/api/holdings?portfolio_id={portfolio_id}")
+            if resp.status_code != 200:
+                logger.warning("Orca holdings fetch failed: %s", resp.status_code)
+                return {"synced": 0, "error": f"Orca HTTP {resp.status_code}"}
+            holdings = resp.json()
+            if isinstance(holdings, dict):
+                holdings = holdings.get("holdings", [])
+
+            rows = []
+            for h in holdings:
+                isin = h.get("isin")
+                if not isin:
+                    continue
+                rows.append({
+                    "portfolio_id": portfolio_id,
+                    "isin": isin,
+                    "par_amount": h.get("par_amount") or h.get("face_value"),
+                    "description": h.get("description") or h.get("name"),
+                })
+
+            if rows:
+                await _upsert("orca_holdings", rows, "portfolio_id,isin")
+
+            logger.info("Orca holdings synced: %d bonds for %s", len(rows), portfolio_id)
+            return {"synced": len(rows), "portfolio_id": portfolio_id}
+    except Exception as e:
+        logger.error("Orca holdings sync failed: %s", e)
+        return {"synced": 0, "error": str(e)}
+
+
 # ── Sync: populate local_bond_* tables in Athena Supabase from bond-data ────
 # These local tables power the recon_view JOINs (fast, indexed).
 # Called on upload and on startup.
@@ -371,8 +412,50 @@ async def _upsert(table: str, rows: list[dict], conflict_keys: str) -> int:
     return len(rows)
 
 
+async def _delete_stale(table: str, portfolio_id: str, date: str, keep_isins: set):
+    """Delete rows for (portfolio_id, date) that are NOT in keep_isins."""
+    _ensure_key()
+    if not SUPABASE_KEY:
+        return
+    # Fetch existing ISINs for this (portfolio_id, date)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=_headers(),
+            params={
+                "portfolio_id": f"eq.{portfolio_id}",
+                "date": f"eq.{date}",
+                "select": "isin",
+            },
+        )
+        if resp.status_code != 200:
+            return
+        existing = {r["isin"] for r in resp.json()}
+    stale = existing - keep_isins
+    if not stale:
+        return
+    # Delete stale rows one by one (Supabase REST doesn't support IN with DELETE easily)
+    async with httpx.AsyncClient(timeout=15) as client:
+        for isin in stale:
+            await client.delete(
+                f"{SUPABASE_URL}/rest/v1/{table}",
+                headers=_headers(),
+                params={
+                    "portfolio_id": f"eq.{portfolio_id}",
+                    "date": f"eq.{date}",
+                    "isin": f"eq.{isin}",
+                },
+            )
+    logger.info(f"{table}: deleted {len(stale)} stale rows for {portfolio_id}/{date}: {stale}")
+
+
 async def store_bbg(portfolio_id: str, date: str, bonds: list[dict], uploaded_by: str = None) -> int:
-    """Store BBG data. Upserts by (portfolio_id, date, isin)."""
+    """Store BBG data. Replaces all rows for (portfolio_id, date) — removes bonds
+    no longer in the upload, then upserts the new set."""
+    # Delete stale rows not in the new upload
+    new_isins = {b.get("isin") for b in bonds if b.get("isin")}
+    if new_isins:
+        await _delete_stale("recon_bbg", portfolio_id, date, new_isins)
     rows = [{
         "portfolio_id": portfolio_id,
         "date": date,
@@ -387,13 +470,17 @@ async def store_bbg(portfolio_id: str, date: str, bonds: list[dict], uploaded_by
         "yield_to_worst": b.get("yield_to_worst"),
         "duration": b.get("duration"),
         "mv": b.get("mv"),
+        "issue_date": b.get("issue_date") or None,
         "uploaded_by": uploaded_by,
     } for b in bonds]
     return await _upsert("recon_bbg", rows, "portfolio_id,date,isin")
 
 
 async def store_admin(portfolio_id: str, date: str, bonds: list[dict], uploaded_by: str = None) -> int:
-    """Store admin NAV data. Upserts by (portfolio_id, date, isin)."""
+    """Store admin NAV data. Replaces all rows for (portfolio_id, date)."""
+    new_isins = {b.get("isin") for b in bonds if b.get("isin")}
+    if new_isins:
+        await _delete_stale("recon_admin", portfolio_id, date, new_isins)
     rows = [{
         "portfolio_id": portfolio_id,
         "date": date,
@@ -414,7 +501,10 @@ async def store_admin(portfolio_id: str, date: str, bonds: list[dict], uploaded_
 
 async def store_maia(portfolio_id: str, date: str, bonds: list[dict],
                      uploaded_by: str = None, fx_cnh_per_usd: float = None) -> int:
-    """Store Maia holdings data. Upserts by (portfolio_id, date, isin)."""
+    """Store Maia holdings data. Replaces all rows for (portfolio_id, date)."""
+    new_isins = {b.get("isin") for b in bonds if b.get("isin")}
+    if new_isins:
+        await _delete_stale("recon_maia", portfolio_id, date, new_isins)
     rows = [{
         "portfolio_id": portfolio_id,
         "date": date,
@@ -434,9 +524,13 @@ async def store_maia(portfolio_id: str, date: str, bonds: list[dict],
 
 async def store_athena_bbg(portfolio_id: str, date: str, rows: list[dict]) -> int:
     """Store Athena's calculations from BBG prices (absolute dollars, par-scaled).
+    Removes bonds no longer in the set, then upserts.
 
     Each row: {isin, par, source_price, accrued_t0, accrued_c1, accrued_t1, accrued_c2, accrued_c3}
     """
+    new_isins = {r.get("isin") for r in rows if r.get("isin")}
+    if new_isins:
+        await _delete_stale("athena_bbg", portfolio_id, date, new_isins)
     upsert_rows = [{
         "portfolio_id": portfolio_id,
         "date": date,
