@@ -140,6 +140,11 @@ async def upload_bbg(
     if result.get("status") == "error":
         await alert_upload_failed("bbg", file.filename, result.get("error", "unknown"), x_user_email)
         raise HTTPException(status_code=422, detail=result.get("error"))
+    # Auto-trigger accrued recalc so the recon tab populates immediately
+    pid = result.get("portfolio_id")
+    bbg_date = result.get("date")
+    if pid and bbg_date:
+        asyncio.create_task(_do_recalc_accrued(pid, bbg_date, force=True))
     return result
 
 
@@ -165,6 +170,11 @@ async def upload_auto(
             file_bytes=contents, filename=file.filename,
             uploaded_by=x_user_email or "unknown",
         )
+        if result.get("status") != "error":
+            pid = result.get("portfolio_id")
+            bbg_date = result.get("date")
+            if pid and bbg_date:
+                asyncio.create_task(_do_recalc_accrued(pid, bbg_date, force=True))
     else:
         result = await process_admin_upload(
             file_bytes=contents, filename=file.filename,
@@ -453,16 +463,8 @@ async def trigger_sync():
     return result
 
 
-@app.post("/recalc/accrued")
-async def recalc_accrued(portfolio_id: str = "wnbf", date: str = None, force: bool = False):
-    """Fast accrued-only recalc using local_bond_reference conventions and
-    orca_holdings for par. No GA10 dependency — computes 30/360 accrued directly.
-
-    Compares result vs BBG and only updates bonds that differ.
-    Pass force=true to recalc ALL bonds regardless of current match status.
-    """
-    if not date:
-        raise HTTPException(status_code=400, detail="date parameter required")
+async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> dict:
+    """Core accrued recalc logic — callable internally or from the HTTP endpoint."""
 
     import httpx
     from datetime import datetime, timedelta
@@ -618,6 +620,19 @@ async def recalc_accrued(portfolio_id: str = "wnbf", date: str = None, force: bo
             "skipped": skipped,
             "bonds": [{"isin": r["isin"], "par": r["par"], "accrued_c1": r["accrued_c1"]} for r in updated_rows],
         }
+
+
+@app.post("/recalc/accrued")
+async def recalc_accrued(portfolio_id: str = "wnbf", date: str = None, force: bool = False):
+    """Fast accrued-only recalc using local_bond_reference conventions and
+    orca_holdings for par. No GA10 dependency — computes 30/360 accrued directly.
+
+    Compares result vs BBG and only updates bonds that differ.
+    Pass force=true to recalc ALL bonds regardless of current match status.
+    """
+    if not date:
+        raise HTTPException(status_code=400, detail="date parameter required")
+    return await _do_recalc_accrued(portfolio_id, date, force)
 
 
 @app.post("/recalc/all")
