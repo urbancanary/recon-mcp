@@ -190,7 +190,7 @@ async def sync_bond_data(isins: list[str] = None) -> dict:
             headers=bdh,
             params={
                 "isin": f"in.({isin_filter})",
-                "select": "isin,ticker_description,currency,standard_country,sector,applied_rating,coupon,maturity_date,day_count",
+                "select": "isin,ticker_description,currency,standard_country,sector,applied_rating,coupon,maturity_date,day_count,frequency,accrual_date",
             },
         )
         analytics_req = client.get(

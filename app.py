@@ -519,11 +519,18 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
         return last_coupon
 
     def _accrued_at(settle: "datetime", coupon: float, freq: int, mat: "datetime",
-                    coup_months: list, coup_day: int, day_count: str, par: float) -> float:
+                    coup_months: list, coup_day: int, day_count: str, par: float,
+                    accrual_start: "datetime | None" = None) -> float:
         """Compute accrued interest for a single settlement date."""
         last_coupon = _last_coupon_before(settle, coup_months, coup_day)
+        # For bonds that haven't paid a first coupon, clamp to accrual_start
+        if last_coupon and accrual_start and last_coupon < accrual_start:
+            last_coupon = accrual_start
         if not last_coupon:
-            return 0.0
+            if accrual_start and accrual_start < settle:
+                last_coupon = accrual_start
+            else:
+                return 0.0
 
         if "30" in day_count:
             d1_day = min(last_coupon.day, 30)
@@ -559,7 +566,7 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
             "select": "isin,par,accrued_c1,source_price",
         })
         ref_task = client.get(f"{SUPABASE_URL}/rest/v1/local_bond_reference", headers=_headers(), params={
-            "select": "isin,coupon,maturity_date,day_count",
+            "select": "isin,coupon,maturity_date,day_count,frequency,accrual_date",
         })
         holdings_task = client.get(f"{SUPABASE_URL}/rest/v1/orca_holdings", headers=_headers(), params={
             "portfolio_id": f"eq.{portfolio_id}",
@@ -623,14 +630,26 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
                 continue
 
             mat = datetime.strptime(maturity[:10], "%Y-%m-%d")
-            freq = 2  # semi-annual
-            coup_months = sorted(set([(mat.month - 1) % 12 + 1, ((mat.month + 5) % 12) + 1]))
+            # Frequency: read from bond reference, default to semi-annual
+            frequency_str = (ref.get("frequency") or "").lower()
+            if frequency_str in ("annual", "annually", "1"):
+                freq = 1
+                coup_months = [mat.month]
+            else:
+                freq = 2
+                coup_months = sorted(set([(mat.month - 1) % 12 + 1, ((mat.month + 5) % 12) + 1]))
             coup_day = min(mat.day, 28)
+
+            # For bonds that haven't paid a first coupon yet, accrual starts from accrual_date
+            accrual_date_str = ref.get("accrual_date")
+            accrual_start = datetime.strptime(accrual_date_str[:10], "%Y-%m-%d") if accrual_date_str else None
 
             args = (coupon, freq, mat, coup_months, coup_day, day_count, par)
             used_convention = day_count if "30" not in day_count else "30/360"
-            # Days since last coupon at T+0 (useful for debugging accrual)
+            # Days since last coupon at T+0 — clamp to accrual_start for new bonds
             lc = _last_coupon_before(trade_date, coup_months, coup_day)
+            if lc and accrual_start and lc < accrual_start:
+                lc = accrual_start
             days_acc = (trade_date - lc).days if lc else None
             updated_rows.append({
                 "isin": isin,
@@ -638,11 +657,11 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
                 "source_price": price,
                 "day_count": used_convention,
                 "days_accrued": days_acc,
-                "accrued_t0": _accrued_at(trade_date,            *args),
-                "accrued_c1": _accrued_at(trade_date + timedelta(days=1), *args),
-                "accrued_t1": _accrued_at(trade_date + timedelta(days=1), *args),
-                "accrued_c2": _accrued_at(trade_date + timedelta(days=2), *args),
-                "accrued_c3": _accrued_at(trade_date + timedelta(days=3), *args),
+                "accrued_t0": _accrued_at(trade_date,                      *args, accrual_start=accrual_start),
+                "accrued_c1": _accrued_at(trade_date + timedelta(days=1),  *args, accrual_start=accrual_start),
+                "accrued_t1": _accrued_at(trade_date + timedelta(days=1),  *args, accrual_start=accrual_start),
+                "accrued_c2": _accrued_at(trade_date + timedelta(days=2),  *args, accrual_start=accrual_start),
+                "accrued_c3": _accrued_at(trade_date + timedelta(days=3),  *args, accrual_start=accrual_start),
             })
 
         # 4. Upsert
