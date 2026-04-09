@@ -20,9 +20,10 @@ DROP VIEW IF EXISTS v_athena_bbg_accrued CASCADE;
 -- ── Stable column contract (do not rename or remove columns) ──────────────────
 -- portfolio_id, date, isin, description, ticker, currency
 -- bbg_nominal, athena_nominal
--- athena_t0, athena_c1, athena_t1, athena_c2, athena_c3
+-- athena_t0*, athena_c1, athena_t1*, athena_c2*, athena_c3*  (* hidden in vs BBG tab)
 -- bbg_accrued  ← par × accrued_pct/100; fallback to stored accrued
 -- diff, diff_pct, par_mismatch
+-- day_count, frequency, last_coupon_date, days_accrued        ← diagnostic
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE VIEW v_athena_bbg_accrued AS
 SELECT
@@ -53,7 +54,12 @@ SELECT
                      / ABS(COALESCE(ab.par * b.accrued_pct / 100, b.accrued)) * 100)::numeric, 2)
          ELSE NULL
     END AS diff_pct,
-    (ab.par IS NOT NULL AND b.par IS NOT NULL AND ab.par != b.par) AS par_mismatch
+    (ab.par IS NOT NULL AND b.par IS NOT NULL AND ab.par != b.par) AS par_mismatch,
+    -- Diagnostic: what did our engine actually use?
+    ab.day_count,
+    br.frequency,
+    ab.last_coupon_date,
+    ab.days_accrued
 FROM athena_bbg ab
 LEFT JOIN recon_bbg b USING (portfolio_id, date, isin)
 LEFT JOIN local_bond_identity bi ON bi.isin = ab.isin

@@ -787,6 +787,7 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
         updated_rows.append({
             "isin": isin, "par": par, "source_price": price,
             "day_count": day_count if "30" not in day_count else "30/360",
+            "last_coupon_date": lc.date().isoformat() if lc else None,
             "days_accrued": days_acc,
             "accrued_t0": _accrued_at(trade_date,                     *args, accrual_start=accrual_start),
             "accrued_c1": _accrued_at(trade_date + timedelta(days=1), *args, accrual_start=accrual_start),
