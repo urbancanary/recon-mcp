@@ -242,17 +242,28 @@ async def sync_bond_data(isins: list[str] = None) -> dict:
 async def enrich_bond_data_from_bbg(
     maturity_date_bonds: dict,
     coupon_bonds: dict,
+    cpn_freq_bonds: dict | None = None,
+    day_count_bonds: dict | None = None,
+    eff_maturity_bonds: dict | None = None,
+    first_coupon_bonds: dict | None = None,
 ) -> dict:
-    """Backfill local_bond_identity and local_bond_reference with BBG-parsed data
-    for fields that are currently NULL. Respects the `locked` flag on local_bond_reference.
+    """Backfill local_bond_identity and local_bond_reference with BBG-parsed data.
+    Respects the `locked` flag on local_bond_reference.
 
     maturity_date_bonds: {isin: 'YYYY-MM-DD'} from Long Name parsing
     coupon_bonds: {isin: float} from Long Name parsing
+    cpn_freq_bonds: {isin: raw_freq} e.g. '2' or 'Semiannual'
+    day_count_bonds: {isin: day_count_str}
+    eff_maturity_bonds: {isin: 'YYYY-MM-DD'} exact BBG maturity (preferred over maturity_date_bonds)
+    first_coupon_bonds: {isin: 'YYYY-MM-DD'}
 
-    Only writes fields that are missing in bond-data (e.g. new bonds not yet in CBonds).
-    Does NOT overwrite existing values or locked rows.
+    BBG is authoritative for maturity_date, frequency, and day_count — always overwrites unlocked rows.
+    Coupon is only filled if currently NULL.
     """
-    all_isins = list(set(list(maturity_date_bonds.keys()) + list(coupon_bonds.keys())))
+    all_isins = list(set(
+        list(maturity_date_bonds.keys()) + list(coupon_bonds.keys()) +
+        list((eff_maturity_bonds or {}).keys()) + list((cpn_freq_bonds or {}).keys())
+    ))
     if not all_isins:
         return {"enriched_identity": 0, "enriched_reference": 0}
 
@@ -272,7 +283,7 @@ async def enrich_bond_data_from_bbg(
             client.get(
                 f"{SUPABASE_URL}/rest/v1/local_bond_reference",
                 headers=_headers(),
-                params={"isin": f"in.({isin_filter})", "select": "isin,maturity_date,coupon,locked"},
+                params={"isin": f"in.({isin_filter})", "select": "isin,maturity_date,coupon,frequency,day_count,locked"},
             ),
         )
 
@@ -308,11 +319,27 @@ async def enrich_bond_data_from_bbg(
         mat = maturity_date_bonds.get(isin)
         coup = coupon_bonds.get(isin)
 
+        # Prefer eff_maturity (exact BBG date) over maturity_date_bonds (regex from Long Name)
+        effective_mat = (eff_maturity_bonds or {}).get(isin) or mat
+
+        # Frequency conversion
+        freq_raw = (cpn_freq_bonds or {}).get(isin)
+        freq_str = None
+        if freq_raw is not None:
+            if str(freq_raw) in ('1', 'Annual', 'ANNUAL', 'A'):
+                freq_str = 'Annual'
+            elif str(freq_raw) in ('2', 'Semi', 'Semiannual', 'SEMIANNUAL', 'SA', 'S/A'):
+                freq_str = 'Semiannual'
+            elif str(freq_raw) in ('4', 'Quarterly', 'QUARTERLY', 'Q'):
+                freq_str = 'Quarterly'
+
+        day_count_val = (day_count_bonds or {}).get(isin)
+
         # local_bond_identity — update NULL fields, no locked check
         cur_id = existing_id.get(isin, {})
         id_patch = {}
-        if mat and not cur_id.get("maturity_date"):
-            id_patch["maturity_date"] = mat
+        if effective_mat and not cur_id.get("maturity_date"):
+            id_patch["maturity_date"] = effective_mat
         if coup is not None and cur_id.get("coupon") is None:
             id_patch["coupon"] = coup
         if id_patch:
@@ -323,13 +350,21 @@ async def enrich_bond_data_from_bbg(
             else:
                 patch_tasks.append(_patch("local_bond_identity", isin, id_patch))
 
-        # local_bond_reference — update NULL fields only on unlocked rows
+        # local_bond_reference — BBG is authoritative for maturity/frequency/day_count on unlocked rows
         cur_ref = existing_ref.get(isin, {})
         if cur_ref.get("locked"):
             continue
         ref_patch = {}
-        if mat and not cur_ref.get("maturity_date"):
-            ref_patch["maturity_date"] = mat
+        # ALWAYS overwrite maturity_date with BBG value (more accurate than CBonds)
+        if effective_mat:
+            ref_patch["maturity_date"] = effective_mat
+        # ALWAYS overwrite frequency with BBG value (authoritative)
+        if freq_str is not None:
+            ref_patch["frequency"] = freq_str
+        # ALWAYS overwrite day_count with BBG value (authoritative)
+        if day_count_val is not None:
+            ref_patch["day_count"] = day_count_val
+        # Only fill coupon if currently NULL
         if coup is not None and cur_ref.get("coupon") is None:
             ref_patch["coupon"] = coup
         if ref_patch:
@@ -582,6 +617,14 @@ async def store_bbg(portfolio_id: str, date: str, bonds: list[dict], uploaded_by
         "duration": b.get("duration"),
         "mv": b.get("mv"),
         "issue_date": b.get("issue_date") or None,
+        "coupon_freq": b.get("coupon_freq"),
+        "day_count": b.get("day_count"),
+        "first_coupon_date": b.get("first_coupon_date") or None,
+        "accrued_pct": b.get("accrued_pct"),
+        "moodys": b.get("moodys"),
+        "sp": b.get("sp"),
+        "fitch": b.get("fitch"),
+        "bb_comp": b.get("bb_comp"),
         "uploaded_by": uploaded_by,
     } for b in bonds]
     return await _upsert("recon_bbg", rows, "portfolio_id,date,isin")

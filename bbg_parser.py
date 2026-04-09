@@ -170,6 +170,53 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
             elif 'long_name' not in col_map and upper in ('LONG NAME', 'LONGNAME', 'SECURITY NAME',
                                                            'SECURITY', 'SEC NAME', 'BOND NAME'):
                 col_map['long_name'] = col
+            # Coupon rate (explicit)
+            elif 'cpn_rate' not in col_map and upper in ('CPN', 'COUPON', 'COUPON RATE', 'CPN RATE'):
+                col_map['cpn_rate'] = col
+            # Coupon frequency (1=Annual, 2=Semi)
+            elif 'cpn_freq' not in col_map and (
+                upper in ('CPN FREQ', 'COUPON FREQ', 'CPN FREQUENCY', 'COUPON FREQUENCY', 'FREQ')
+                or upper.replace(' ', '').replace('_', '') in ('CPNFREQ', 'COUPONFREQ')
+            ):
+                col_map['cpn_freq'] = col
+            # Day Count convention
+            elif 'day_count' not in col_map and (
+                upper in ('DAY COUNT', 'DAY COUNT CONV', 'DAY_COUNT', 'DCB')
+                or ('DAY' in upper and 'COUNT' in upper)
+            ):
+                col_map['day_count'] = col
+            # Effective / Exact Maturity Date (not month-end rounded like CBonds)
+            elif 'eff_maturity' not in col_map and (
+                upper in ('EFF MATURITY DATE', 'EFF MATURITY', 'EFFECTIVE MATURITY DATE',
+                          'EFFECTIVE MATURITY', 'MTY', 'MATURITY')
+                or (('EFF' in upper or 'EFFECTIVE' in upper) and 'MATURI' in upper)
+            ):
+                col_map['eff_maturity'] = col
+            # First Coupon Date
+            elif 'first_coupon' not in col_map and (
+                upper in ('FIRST CPN DT', 'FIRST COUPON DATE', 'FIRST COUPON', 'FIRST CPN DATE',
+                          '1ST CPN DT', 'IST CPN DT')
+                or ('FIRST' in upper and ('CPN' in upper or 'COUPON' in upper))
+            ):
+                col_map['first_coupon'] = col
+            # Accrued Int (%) — per-100 accrued in local currency (most reliable cross-currency value)
+            elif 'accrued_pct' not in col_map and '%' in upper and 'ACCRUED' in upper:
+                col_map['accrued_pct'] = col
+            # Moody's rating
+            elif 'moodys' not in col_map and upper.replace("'", '').replace('\u2019', '') in (
+                'MOODYS', 'MOODYS RATING', 'MDY', 'MOODYS LONG TERM'
+            ):
+                col_map['moodys'] = col
+            # S&P rating
+            elif 'sp' not in col_map and upper in ('S&P', 'SP', 'S&P RATING', 'S&P LONG TERM', 'S&P LT'):
+                col_map['sp'] = col
+            # Fitch rating
+            elif 'fitch' not in col_map and upper in ('FITCH', 'FITCH RATING', 'FITCH LONG TERM'):
+                col_map['fitch'] = col
+            # Bloomberg Composite rating
+            elif 'bb_comp' not in col_map and upper in ('BB COMP', 'BBG COMP', 'BLOOMBERG COMPOSITE',
+                                                         'COMPOSITE RATING', 'BB COMP RATING'):
+                col_map['bb_comp'] = col
 
         logger.info("BBG columns detected: %s → col_map: %s", [str(c) for c in df.columns], col_map)
 
@@ -202,6 +249,17 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
         issue_date_bonds = {}   # Issue date per bond
         maturity_date_bonds = {}  # Maturity date parsed from Long Name (more accurate than CBonds)
         coupon_bonds = {}         # Coupon parsed from Long Name, e.g. "CGB 3.38 07/04/26" → 3.38
+        cpn_rate_bonds = {}       # Explicit coupon rate from Cpn column
+        cpn_freq_bonds = {}       # Coupon frequency (1=Annual, 2=Semi)
+        day_count_bonds = {}      # Day count convention
+        eff_maturity_bonds = {}   # Exact maturity date from BBG
+        first_coupon_bonds = {}   # First coupon date
+        accrued_pct_bonds = {}    # Per-100 accrued in local currency
+        moodys_bonds = {}         # Moody's rating
+        sp_bonds = {}             # S&P rating
+        fitch_bonds = {}          # Fitch rating
+        bb_comp_bonds = {}        # Bloomberg composite rating
+        bonds_from_pct = {}       # Absolute accrued computed from pos × accrued_pct/100 (pre-scale)
         raw_values = []
 
         # Regex to extract MM/DD/YY maturity from BBG Long Name, e.g. "CGB 3.38 07/04/26"
@@ -320,6 +378,114 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
                 except (ValueError, TypeError):
                     pass
 
+            # Extract new fields
+            if col_map.get('cpn_rate') is not None:
+                try:
+                    cr = float(row[col_map['cpn_rate']])
+                    if not (cr != cr):  # not NaN
+                        cpn_rate_bonds[isin] = cr
+                except (ValueError, TypeError):
+                    pass
+
+            if col_map.get('cpn_freq') is not None:
+                try:
+                    cf = row[col_map['cpn_freq']]
+                    if pd.notna(cf):
+                        cpn_freq_bonds[isin] = str(int(float(cf))) if str(cf).replace('.', '').isdigit() else str(cf).strip()
+                except (ValueError, TypeError):
+                    pass
+
+            if col_map.get('day_count') is not None:
+                try:
+                    dc = str(row[col_map['day_count']]).strip()
+                    if dc and dc.lower() != 'nan':
+                        day_count_bonds[isin] = dc
+                except (ValueError, TypeError):
+                    pass
+
+            if col_map.get('eff_maturity') is not None:
+                try:
+                    em = row[col_map['eff_maturity']]
+                    if pd.notna(em):
+                        if hasattr(em, 'strftime'):
+                            eff_maturity_bonds[isin] = em.strftime('%Y-%m-%d')
+                        else:
+                            s = str(em).strip()
+                            if s and s != 'nan':
+                                for dfmt in ('%m/%d/%Y', '%m/%d/%y', '%Y-%m-%d', '%d/%m/%Y'):
+                                    try:
+                                        from datetime import datetime as _dt
+                                        eff_maturity_bonds[isin] = _dt.strptime(s, dfmt).strftime('%Y-%m-%d')
+                                        break
+                                    except ValueError:
+                                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            if col_map.get('first_coupon') is not None:
+                try:
+                    fc = row[col_map['first_coupon']]
+                    if pd.notna(fc):
+                        if hasattr(fc, 'strftime'):
+                            first_coupon_bonds[isin] = fc.strftime('%Y-%m-%d')
+                        else:
+                            s = str(fc).strip()
+                            if s and s != 'nan':
+                                for dfmt in ('%m/%d/%Y', '%m/%d/%y', '%Y-%m-%d', '%d/%m/%Y'):
+                                    try:
+                                        from datetime import datetime as _dt
+                                        first_coupon_bonds[isin] = _dt.strptime(s, dfmt).strftime('%Y-%m-%d')
+                                        break
+                                    except ValueError:
+                                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            if col_map.get('accrued_pct') is not None:
+                try:
+                    pct = float(row[col_map['accrued_pct']])
+                    if not (pct != pct):
+                        accrued_pct_bonds[isin] = pct
+                        # Compute absolute accrued from pos × pct/100 BEFORE any scaling.
+                        # This gives correct local-currency accrued for all bond currencies.
+                        if col_map.get('position') is not None:
+                            pos_raw = float(row[col_map['position']])
+                            bonds_from_pct[isin] = pos_raw * pct / 100
+                except (ValueError, TypeError):
+                    pass
+
+            if col_map.get('moodys') is not None:
+                try:
+                    rv = str(row[col_map['moodys']]).strip()
+                    if rv and rv.lower() not in ('nan', 'nr', 'n/r', 'n.r.', 'n/a'):
+                        moodys_bonds[isin] = rv
+                except (ValueError, TypeError):
+                    pass
+
+            if col_map.get('sp') is not None:
+                try:
+                    rv = str(row[col_map['sp']]).strip()
+                    if rv and rv.lower() not in ('nan', 'nr', 'n/r', 'n.r.', 'n/a'):
+                        sp_bonds[isin] = rv
+                except (ValueError, TypeError):
+                    pass
+
+            if col_map.get('fitch') is not None:
+                try:
+                    rv = str(row[col_map['fitch']]).strip()
+                    if rv and rv.lower() not in ('nan', 'nr', 'n/r', 'n.r.', 'n/a'):
+                        fitch_bonds[isin] = rv
+                except (ValueError, TypeError):
+                    pass
+
+            if col_map.get('bb_comp') is not None:
+                try:
+                    rv = str(row[col_map['bb_comp']]).strip()
+                    if rv and rv.lower() not in ('nan', 'nr', 'n/r', 'n.r.', 'n/a'):
+                        bb_comp_bonds[isin] = rv
+                except (ValueError, TypeError):
+                    pass
+
         # BBG PORT exports store values in thousands — detect and correct.
         # When accrued values are in thousands, so are par (position) and market value.
         if raw_values:
@@ -340,6 +506,12 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
                 logger.info("BBG par values oversized (median=%.0f), dividing par/mv by 1000", median_pos)
                 position_bonds = {k: v / 1000 for k, v in position_bonds.items()}
                 mv_bonds = {k: v / 1000 for k, v in mv_bonds.items()}
+
+        # If we computed absolute accrued from pos × accrued_pct/100 (pre-scale), use that
+        # to replace/supplement the Acc Int-derived values. This avoids FX/scale issues
+        # for multi-currency portfolios (e.g. CNH base portfolio with USD bonds).
+        if bonds_from_pct:
+            bonds.update(bonds_from_pct)
 
         # Get settle date from data if available
         settle_date = None
@@ -383,8 +555,18 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
         bbg_securities_mv = sum(mv_bonds.values()) if mv_bonds else None
 
         yield_source = 'YTM' if col_map.get('ytm') else ('YTW' if col_map.get('ytw') else 'none')
-        logger.info("BBG export parsed: %d bonds, as_of=%s, settle=%s, base_ccy=%s, yield_col=%s (%d bonds), price_bonds=%d, oad_bonds=%d, mv_bonds=%d, issue_dates=%d, maturity_dates=%d, coupons=%d",
-                    len(bonds), as_of_date, settle_date, base_currency, yield_source, len(yield_bonds), len(price_bonds), len(oad_bonds), len(mv_bonds), len(issue_date_bonds), len(maturity_date_bonds), len(coupon_bonds))
+        logger.info(
+            "BBG export parsed: %d bonds, as_of=%s, settle=%s, base_ccy=%s, yield_col=%s (%d bonds), "
+            "price_bonds=%d, oad_bonds=%d, mv_bonds=%d, issue_dates=%d, maturity_dates=%d, coupons=%d, "
+            "cpn_rate=%d, cpn_freq=%d, day_count=%d, eff_maturity=%d, first_coupon=%d, accrued_pct=%d, "
+            "moodys=%d, sp=%d, fitch=%d, bb_comp=%d",
+            len(bonds), as_of_date, settle_date, base_currency, yield_source, len(yield_bonds),
+            len(price_bonds), len(oad_bonds), len(mv_bonds), len(issue_date_bonds),
+            len(maturity_date_bonds), len(coupon_bonds),
+            len(cpn_rate_bonds), len(cpn_freq_bonds), len(day_count_bonds), len(eff_maturity_bonds),
+            len(first_coupon_bonds), len(accrued_pct_bonds),
+            len(moodys_bonds), len(sp_bonds), len(fitch_bonds), len(bb_comp_bonds),
+        )
 
         return {
             "type": "bbg",
@@ -399,6 +581,16 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
             "issue_date_bonds": issue_date_bonds,
             "maturity_date_bonds": maturity_date_bonds,
             "coupon_bonds": coupon_bonds,
+            "cpn_rate_bonds": cpn_rate_bonds,
+            "cpn_freq_bonds": cpn_freq_bonds,
+            "day_count_bonds": day_count_bonds,
+            "eff_maturity_bonds": eff_maturity_bonds,
+            "first_coupon_bonds": first_coupon_bonds,
+            "accrued_pct_bonds": accrued_pct_bonds,
+            "moodys_bonds": moodys_bonds,
+            "sp_bonds": sp_bonds,
+            "fitch_bonds": fitch_bonds,
+            "bb_comp_bonds": bb_comp_bonds,
             "bbg_securities_mv": bbg_securities_mv,
             "bbg_total_mv": total_mv_with_cash,
             "count": len(bonds),

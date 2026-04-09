@@ -684,6 +684,16 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
     issue_date_bonds = bbg_result.get("issue_date_bonds", {})
     maturity_date_bonds = bbg_result.get("maturity_date_bonds", {})
     coupon_bonds = bbg_result.get("coupon_bonds", {})
+    cpn_rate_bonds = bbg_result.get("cpn_rate_bonds", {})
+    cpn_freq_bonds = bbg_result.get("cpn_freq_bonds", {})
+    day_count_bonds = bbg_result.get("day_count_bonds", {})
+    eff_maturity_bonds = bbg_result.get("eff_maturity_bonds", {})
+    first_coupon_bonds = bbg_result.get("first_coupon_bonds", {})
+    accrued_pct_bonds = bbg_result.get("accrued_pct_bonds", {})
+    moodys_bonds = bbg_result.get("moodys_bonds", {})
+    sp_bonds = bbg_result.get("sp_bonds", {})
+    fitch_bonds = bbg_result.get("fitch_bonds", {})
+    bb_comp_bonds = bbg_result.get("bb_comp_bonds", {})
     all_isins = list(set(list(price_bonds.keys()) + list(accrued_bonds.keys())))
 
     ref_by_isin = await lookup_bond_reference(all_isins)
@@ -695,8 +705,8 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
             "isin": isin,
             "description": ref.get("description", ""),
             "currency": ref.get("currency", "USD"),
-            "coupon": ref.get("coupon"),
-            "maturity_date": ref.get("maturity_date") or None,
+            "coupon": cpn_rate_bonds.get(isin) or coupon_bonds.get(isin) or ref.get("coupon"),
+            "maturity_date": eff_maturity_bonds.get(isin) or maturity_date_bonds.get(isin) or ref.get("maturity_date") or None,
             "price": price_bonds.get(isin),
             "accrued": accrued_bonds.get(isin),
             "yield_to_worst": yield_bonds.get(isin),
@@ -704,7 +714,14 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
             "mv": mv_bonds.get(isin),
             "par": position_bonds.get(isin),
             "issue_date": issue_date_bonds.get(isin),
-            "maturity_date": maturity_date_bonds.get(isin) or ref.get("maturity_date") or None,
+            "coupon_freq": cpn_freq_bonds.get(isin),
+            "day_count": day_count_bonds.get(isin),
+            "first_coupon_date": first_coupon_bonds.get(isin),
+            "accrued_pct": accrued_pct_bonds.get(isin),
+            "moodys": moodys_bonds.get(isin),
+            "sp": sp_bonds.get(isin),
+            "fitch": fitch_bonds.get(isin),
+            "bb_comp": bb_comp_bonds.get(isin),
         })
 
     # Store parsed data + raw file in parallel
@@ -722,7 +739,14 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
 
     # Enrich local bond tables with BBG-parsed maturity/coupon for NULL fields.
     # Awaited so that local_bond_reference is up-to-date before the recalc fires.
-    await enrich_bond_data_from_bbg(maturity_date_bonds, coupon_bonds)
+    await enrich_bond_data_from_bbg(
+        maturity_date_bonds,
+        coupon_bonds,
+        cpn_freq_bonds=cpn_freq_bonds,
+        day_count_bonds=day_count_bonds,
+        eff_maturity_bonds=eff_maturity_bonds,
+        first_coupon_bonds=first_coupon_bonds,
+    )
 
     # Sync bond data + Orca holdings for uploaded ISINs (fire-and-forget)
     asyncio.create_task(sync_bond_data(all_isins))

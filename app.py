@@ -526,6 +526,9 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
         # For bonds that haven't paid a first coupon, clamp to accrual_start
         if last_coupon and accrual_start and last_coupon < accrual_start:
             last_coupon = accrual_start
+        # Phantom coupon: coup_day rounding can create a date just after issue — discard it
+        if last_coupon and accrual_start and last_coupon >= accrual_start and (last_coupon - accrual_start).days < 30:
+            last_coupon = accrual_start
         if not last_coupon:
             if accrual_start and accrual_start < settle:
                 last_coupon = accrual_start
@@ -537,6 +540,9 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
             d2_day = min(settle.day, 30) if d1_day == 30 else settle.day
             days = (settle.year - last_coupon.year) * 360 + (settle.month - last_coupon.month) * 30 + (d2_day - d1_day)
             accrued_per_100 = coupon / freq * days / (360 / freq)
+        elif "365" in day_count:
+            actual_days = (settle - last_coupon).days
+            accrued_per_100 = coupon / freq * actual_days / 365
         else:
             actual_days = (settle - last_coupon).days
             next_coupon = None
@@ -638,7 +644,7 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
             else:
                 freq = 2
                 coup_months = sorted(set([(mat.month - 1) % 12 + 1, ((mat.month + 5) % 12) + 1]))
-            coup_day = min(mat.day, 28)
+            coup_day = mat.day
 
             # For bonds that haven't paid a first coupon yet, accrual starts from accrual_date
             accrual_date_str = ref.get("accrual_date")
@@ -649,6 +655,9 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
             # Days since last coupon at T+0 — clamp to accrual_start for new bonds
             lc = _last_coupon_before(trade_date, coup_months, coup_day)
             if lc and accrual_start and lc < accrual_start:
+                lc = accrual_start
+            # Phantom coupon: coup_day rounding can create a date just after issue — discard it
+            if lc and accrual_start and lc >= accrual_start and (lc - accrual_start).days < 30:
                 lc = accrual_start
             days_acc = (trade_date - lc).days if lc else None
             updated_rows.append({
