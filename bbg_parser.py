@@ -291,12 +291,15 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
                 except (ValueError, TypeError):
                     pass
 
-        # BBG PORT exports store values in thousands — detect and correct
+        # BBG PORT exports store values in thousands — detect and correct.
+        # When accrued values are in thousands, so are par (position) and market value.
         if raw_values:
             median_val = sorted(raw_values)[len(raw_values) // 2]
             if median_val > 100000:
-                logger.info("BBG values appear to be in thousands (median=%.0f), dividing by 1000", median_val)
+                logger.info("BBG values appear to be in thousands (median=%.0f), dividing accrued/par/mv by 1000", median_val)
                 bonds = {k: v / 1000 for k, v in bonds.items()}
+                position_bonds = {k: v / 1000 for k, v in position_bonds.items()}
+                mv_bonds = {k: v / 1000 for k, v in mv_bonds.items()}
 
         # Get settle date from data if available
         settle_date = None
