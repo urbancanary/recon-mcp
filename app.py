@@ -803,6 +803,7 @@ async def recalc_single_bond(isin: str, date: str, portfolio_id: str = "wnbf"):
             "ga10_spread": t0.get("spread"),
             "ga10_convexity": t0.get("convexity"),
             "ga10_dv01": t0.get("dv01") or t0.get("pvbp"),
+            "convention_used": t0.get("day_count"),
         }
         await store_calcs(portfolio_id, date, [calc])
 

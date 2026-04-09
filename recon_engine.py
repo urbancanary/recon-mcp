@@ -607,6 +607,7 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
                         "ga10_spread": b.get("spread"),
                         "ga10_convexity": b.get("convexity"),
                         "ga10_dv01": b.get("dv01"),
+                        "convention_used": b.get("day_count"),
                     })
 
                     if par:
