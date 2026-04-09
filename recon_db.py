@@ -679,6 +679,8 @@ async def store_calcs(portfolio_id: str, date: str, calcs: list[dict]) -> int:
         "ga10_convexity": c.get("ga10_convexity"),
         "ga10_dv01": c.get("ga10_dv01"),
         "convention_used": c.get("convention_used"),
+        "last_coupon_date": c.get("last_coupon_date"),
+        "issue_date": c.get("issue_date"),
     } for c in calcs]
     return await _upsert("recon_calcs", rows, "portfolio_id,date,isin")
 
