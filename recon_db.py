@@ -11,6 +11,7 @@ All recon queries go through here. Portfolio + date are always explicit keys.
 """
 
 import os
+import asyncio
 import logging
 import httpx
 from datetime import datetime, timedelta
