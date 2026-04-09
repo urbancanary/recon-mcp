@@ -678,6 +678,7 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
     mv_bonds = bbg_result.get("mv_bonds", {})
     position_bonds = bbg_result.get("position_bonds", {})
     issue_date_bonds = bbg_result.get("issue_date_bonds", {})
+    maturity_date_bonds = bbg_result.get("maturity_date_bonds", {})
     all_isins = list(set(list(price_bonds.keys()) + list(accrued_bonds.keys())))
 
     ref_by_isin = await lookup_bond_reference(all_isins)
@@ -698,6 +699,7 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
             "mv": mv_bonds.get(isin),
             "par": position_bonds.get(isin),
             "issue_date": issue_date_bonds.get(isin),
+            "maturity_date": maturity_date_bonds.get(isin) or ref.get("maturity_date") or None,
         })
 
     # Store parsed data + raw file in parallel

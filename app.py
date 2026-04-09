@@ -515,7 +515,7 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
         # 1. Fetch all sources in parallel
         bbg_task = client.get(f"{SUPABASE_URL}/rest/v1/recon_bbg", headers=_headers(), params={
             "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
-            "select": "isin,par,price,accrued",
+            "select": "isin,par,price,accrued,maturity_date",
         })
         athena_task = client.get(f"{SUPABASE_URL}/rest/v1/athena_bbg", headers=_headers(), params={
             "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
@@ -570,7 +570,8 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
                 continue
 
             coupon = float(ref["coupon"])
-            maturity = ref["maturity_date"]
+            # Prefer BBG-parsed maturity (from Long Name, exact date) over CBonds which rounds to month-end
+            maturity = bbg.get("maturity_date") or ref["maturity_date"]
             day_count = ref.get("day_count") or "30/360"
 
             # Par priority: orca_holdings > bbg > athena_bbg

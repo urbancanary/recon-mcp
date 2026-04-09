@@ -5,6 +5,8 @@ Extracts ISIN + accrued interest for reconciliation.
 """
 
 import logging
+import re
+from datetime import datetime
 import pandas as pd
 from io import BytesIO
 
@@ -164,6 +166,10 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
                 or (upper.startswith('ISS') and 'DT' in upper and len(upper) <= 10)
             ):
                 col_map['issue_date'] = col
+            # Long Name — contains embedded maturity date, e.g. "CGB 3.38 07/04/26"
+            elif 'long_name' not in col_map and upper in ('LONG NAME', 'LONGNAME', 'SECURITY NAME',
+                                                           'SECURITY', 'SEC NAME', 'BOND NAME'):
+                col_map['long_name'] = col
 
         logger.info("BBG columns detected: %s → col_map: %s", [str(c) for c in df.columns], col_map)
 
@@ -184,6 +190,7 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
         mv_col = col_map.get('mv')
         position_col = col_map.get('position')
         issue_date_col = col_map.get('issue_date')
+        long_name_col = col_map.get('long_name')
         bonds = {}
         yield_bonds = {}    # Primary yield (YTM preferred, YTW fallback)
         ytm_bonds = {}      # YTM specifically
@@ -192,8 +199,12 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
         oad_bonds = {}
         mv_bonds = {}         # Market value per bond
         position_bonds = {}   # Position/par per bond
-        issue_date_bonds = {} # Issue date per bond
+        issue_date_bonds = {}   # Issue date per bond
+        maturity_date_bonds = {}  # Maturity date parsed from Long Name (more accurate than CBonds)
         raw_values = []
+
+        # Regex to extract MM/DD/YY maturity from BBG Long Name, e.g. "CGB 3.38 07/04/26"
+        _mat_re = re.compile(r'(\d{2}/\d{2}/\d{2})\s*$')
         for _, row in df.iterrows():
             isin = str(row[isin_col]).strip()
             if not isin or len(isin) < 12 or not isin[:2].isalpha():
@@ -291,6 +302,18 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
                 except (ValueError, TypeError):
                     pass
 
+            # Parse maturity date from Long Name: "CGB 3.38 07/04/26" → 2026-07-04
+            if long_name_col is not None:
+                try:
+                    ln = str(row[long_name_col]).strip() if pd.notna(row[long_name_col]) else ''
+                    m = _mat_re.search(ln)
+                    if m:
+                        mat_str = m.group(1)  # MM/DD/YY
+                        mat_dt = datetime.strptime(mat_str, '%m/%d/%y')
+                        maturity_date_bonds[isin] = mat_dt.strftime('%Y-%m-%d')
+                except (ValueError, TypeError):
+                    pass
+
         # BBG PORT exports store values in thousands — detect and correct.
         # When accrued values are in thousands, so are par (position) and market value.
         if raw_values:
@@ -343,8 +366,8 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
         bbg_securities_mv = sum(mv_bonds.values()) if mv_bonds else None
 
         yield_source = 'YTM' if col_map.get('ytm') else ('YTW' if col_map.get('ytw') else 'none')
-        logger.info("BBG export parsed: %d bonds, as_of=%s, settle=%s, base_ccy=%s, yield_col=%s (%d bonds), price_bonds=%d, oad_bonds=%d, mv_bonds=%d, issue_dates=%d",
-                    len(bonds), as_of_date, settle_date, base_currency, yield_source, len(yield_bonds), len(price_bonds), len(oad_bonds), len(mv_bonds), len(issue_date_bonds))
+        logger.info("BBG export parsed: %d bonds, as_of=%s, settle=%s, base_ccy=%s, yield_col=%s (%d bonds), price_bonds=%d, oad_bonds=%d, mv_bonds=%d, issue_dates=%d, maturity_dates=%d",
+                    len(bonds), as_of_date, settle_date, base_currency, yield_source, len(yield_bonds), len(price_bonds), len(oad_bonds), len(mv_bonds), len(issue_date_bonds), len(maturity_date_bonds))
 
         return {
             "type": "bbg",
@@ -357,6 +380,7 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
             "mv_bonds": mv_bonds,
             "position_bonds": position_bonds,
             "issue_date_bonds": issue_date_bonds,
+            "maturity_date_bonds": maturity_date_bonds,
             "bbg_securities_mv": bbg_securities_mv,
             "bbg_total_mv": total_mv_with_cash,
             "count": len(bonds),
