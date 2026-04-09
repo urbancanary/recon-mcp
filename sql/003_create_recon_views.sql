@@ -15,8 +15,15 @@
 -- Tab: Recon > Accrued > vs BBG
 -- ════════════════════════════════════════════════════════════════════
 
-DROP VIEW IF EXISTS v_athena_bbg_accrued;
+DROP VIEW IF EXISTS v_athena_bbg_accrued CASCADE;
 
+-- ── Stable column contract (do not rename or remove columns) ──────────────────
+-- portfolio_id, date, isin, description, ticker, currency
+-- bbg_nominal, athena_nominal
+-- athena_t0, athena_c1, athena_t1, athena_c2, athena_c3
+-- bbg_accrued  ← par × accrued_pct/100; fallback to stored accrued
+-- diff, diff_pct, par_mismatch
+-- ─────────────────────────────────────────────────────────────────────────────
 CREATE VIEW v_athena_bbg_accrued AS
 SELECT
     ab.portfolio_id,
@@ -32,12 +39,18 @@ SELECT
     ab.accrued_t1 AS athena_t1,
     ab.accrued_c2 AS athena_c2,
     ab.accrued_c3 AS athena_c3,
-    b.accrued     AS bbg,
-    CASE WHEN ab.accrued_c1 IS NOT NULL AND b.accrued IS NOT NULL
-         THEN ab.accrued_c1 - b.accrued ELSE NULL
+    -- par × accrued_pct/100 gives local-currency accrued, avoids FX/scale issues.
+    -- Falls back to stored b.accrued for uploads before accrued_pct was added.
+    COALESCE(ab.par * b.accrued_pct / 100, b.accrued) AS bbg_accrued,
+    CASE WHEN ab.accrued_c1 IS NOT NULL
+              AND COALESCE(ab.par * b.accrued_pct / 100, b.accrued) IS NOT NULL
+         THEN ab.accrued_c1 - COALESCE(ab.par * b.accrued_pct / 100, b.accrued) ELSE NULL
     END AS diff,
-    CASE WHEN ab.accrued_c1 IS NOT NULL AND b.accrued IS NOT NULL AND b.accrued != 0
-         THEN ROUND(((ab.accrued_c1 - b.accrued) / ABS(b.accrued) * 100)::numeric, 2)
+    CASE WHEN ab.accrued_c1 IS NOT NULL
+              AND COALESCE(ab.par * b.accrued_pct / 100, b.accrued) IS NOT NULL
+              AND COALESCE(ab.par * b.accrued_pct / 100, b.accrued) != 0
+         THEN ROUND(((ab.accrued_c1 - COALESCE(ab.par * b.accrued_pct / 100, b.accrued))
+                     / ABS(COALESCE(ab.par * b.accrued_pct / 100, b.accrued)) * 100)::numeric, 2)
          ELSE NULL
     END AS diff_pct,
     (ab.par IS NOT NULL AND b.par IS NOT NULL AND ab.par != b.par) AS par_mismatch
