@@ -95,7 +95,7 @@ async def _backfill_missing_days_accrued():
             return
         logger.info("Startup: recalculating days_accrued for %d date(s): %s", len(pairs), pairs)
         for pid, date in pairs:
-            await _do_recalc_accrued(pid, date, force=True)
+            await _recalc_accrued(pid, date, force=True)
         logger.info("Startup: days_accrued backfill complete")
     except Exception as e:
         logger.warning("Startup days_accrued backfill failed: %s", e)
@@ -178,7 +178,7 @@ async def upload_bbg(
     pid = result.get("portfolio_id")
     bbg_date = result.get("date")
     if pid and bbg_date:
-        asyncio.create_task(_do_recalc_accrued(pid, bbg_date, force=True))
+        asyncio.create_task(_recalc_accrued(pid, bbg_date, force=True))
     return result
 
 
@@ -208,7 +208,7 @@ async def upload_auto(
             pid = result.get("portfolio_id")
             bbg_date = result.get("date")
             if pid and bbg_date:
-                asyncio.create_task(_do_recalc_accrued(pid, bbg_date, force=True))
+                asyncio.create_task(_recalc_accrued(pid, bbg_date, force=True))
     else:
         result = await process_admin_upload(
             file_bytes=contents, filename=file.filename,
