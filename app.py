@@ -591,10 +591,12 @@ async def _do_recalc_accrued(portfolio_id: str, date: str, force: bool = False) 
             coup_day = min(mat.day, 28)
 
             args = (coupon, freq, mat, coup_months, coup_day, day_count, par)
+            used_convention = day_count if "30" not in day_count else "30/360"
             updated_rows.append({
                 "isin": isin,
                 "par": par,
                 "source_price": price,
+                "day_count": used_convention,
                 "accrued_t0": _accrued_at(trade_date,            *args),
                 "accrued_c1": _accrued_at(trade_date + timedelta(days=1), *args),
                 "accrued_t1": _accrued_at(trade_date + timedelta(days=1), *args),
