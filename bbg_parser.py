@@ -201,10 +201,13 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
         position_bonds = {}   # Position/par per bond
         issue_date_bonds = {}   # Issue date per bond
         maturity_date_bonds = {}  # Maturity date parsed from Long Name (more accurate than CBonds)
+        coupon_bonds = {}         # Coupon parsed from Long Name, e.g. "CGB 3.38 07/04/26" → 3.38
         raw_values = []
 
         # Regex to extract MM/DD/YY maturity from BBG Long Name, e.g. "CGB 3.38 07/04/26"
         _mat_re = re.compile(r'(\d{2}/\d{2}/\d{2})\s*$')
+        # Regex to extract coupon from Long Name, e.g. "CGB 3.38 07/04/26" → 3.38
+        _coupon_re = re.compile(r'\s(\d+\.?\d+)\s+\d{2}/\d{2}/\d{2}\s*$')
         for _, row in df.iterrows():
             isin = str(row[isin_col]).strip()
             if not isin or len(isin) < 12 or not isin[:2].isalpha():
@@ -302,7 +305,7 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
                 except (ValueError, TypeError):
                     pass
 
-            # Parse maturity date from Long Name: "CGB 3.38 07/04/26" → 2026-07-04
+            # Parse maturity date and coupon from Long Name: "CGB 3.38 07/04/26"
             if long_name_col is not None:
                 try:
                     ln = str(row[long_name_col]).strip() if pd.notna(row[long_name_col]) else ''
@@ -311,6 +314,9 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
                         mat_str = m.group(1)  # MM/DD/YY
                         mat_dt = datetime.strptime(mat_str, '%m/%d/%y')
                         maturity_date_bonds[isin] = mat_dt.strftime('%Y-%m-%d')
+                    c = _coupon_re.search(ln)
+                    if c:
+                        coupon_bonds[isin] = float(c.group(1))
                 except (ValueError, TypeError):
                     pass
 
@@ -366,8 +372,8 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
         bbg_securities_mv = sum(mv_bonds.values()) if mv_bonds else None
 
         yield_source = 'YTM' if col_map.get('ytm') else ('YTW' if col_map.get('ytw') else 'none')
-        logger.info("BBG export parsed: %d bonds, as_of=%s, settle=%s, base_ccy=%s, yield_col=%s (%d bonds), price_bonds=%d, oad_bonds=%d, mv_bonds=%d, issue_dates=%d, maturity_dates=%d",
-                    len(bonds), as_of_date, settle_date, base_currency, yield_source, len(yield_bonds), len(price_bonds), len(oad_bonds), len(mv_bonds), len(issue_date_bonds), len(maturity_date_bonds))
+        logger.info("BBG export parsed: %d bonds, as_of=%s, settle=%s, base_ccy=%s, yield_col=%s (%d bonds), price_bonds=%d, oad_bonds=%d, mv_bonds=%d, issue_dates=%d, maturity_dates=%d, coupons=%d",
+                    len(bonds), as_of_date, settle_date, base_currency, yield_source, len(yield_bonds), len(price_bonds), len(oad_bonds), len(mv_bonds), len(issue_date_bonds), len(maturity_date_bonds), len(coupon_bonds))
 
         return {
             "type": "bbg",
@@ -381,6 +387,7 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
             "position_bonds": position_bonds,
             "issue_date_bonds": issue_date_bonds,
             "maturity_date_bonds": maturity_date_bonds,
+            "coupon_bonds": coupon_bonds,
             "bbg_securities_mv": bbg_securities_mv,
             "bbg_total_mv": total_mv_with_cash,
             "count": len(bonds),

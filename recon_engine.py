@@ -17,6 +17,7 @@ import httpx
 from recon_db import (
     store_bbg, store_admin, store_maia, store_calcs, store_athena_bbg,
     store_raw_upload, lookup_bond_reference, sync_bond_data, sync_orca_holdings,
+    enrich_bond_data_from_bbg,
     SUPABASE_URL, _headers,
 )
 from alerts import (
@@ -679,6 +680,7 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
     position_bonds = bbg_result.get("position_bonds", {})
     issue_date_bonds = bbg_result.get("issue_date_bonds", {})
     maturity_date_bonds = bbg_result.get("maturity_date_bonds", {})
+    coupon_bonds = bbg_result.get("coupon_bonds", {})
     all_isins = list(set(list(price_bonds.keys()) + list(accrued_bonds.keys())))
 
     ref_by_isin = await lookup_bond_reference(all_isins)
@@ -718,6 +720,8 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
     # Sync bond data + Orca holdings for uploaded ISINs (fire-and-forget)
     asyncio.create_task(sync_bond_data(all_isins))
     asyncio.create_task(sync_orca_holdings(pid))
+    # Backfill local bond tables with BBG-parsed data for NULL fields (respects locked)
+    asyncio.create_task(enrich_bond_data_from_bbg(maturity_date_bonds, coupon_bonds))
 
     asyncio.create_task(alert_upload_success("bbg", pid, bbg_date, len(bbg_bonds), filename))
 

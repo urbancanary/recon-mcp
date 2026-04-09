@@ -239,6 +239,117 @@ async def sync_bond_data(isins: list[str] = None) -> dict:
     return counts
 
 
+async def enrich_bond_data_from_bbg(
+    maturity_date_bonds: dict,
+    coupon_bonds: dict,
+) -> dict:
+    """Backfill local_bond_identity and local_bond_reference with BBG-parsed data
+    for fields that are currently NULL. Respects the `locked` flag on local_bond_reference.
+
+    maturity_date_bonds: {isin: 'YYYY-MM-DD'} from Long Name parsing
+    coupon_bonds: {isin: float} from Long Name parsing
+
+    Only writes fields that are missing in bond-data (e.g. new bonds not yet in CBonds).
+    Does NOT overwrite existing values or locked rows.
+    """
+    all_isins = list(set(list(maturity_date_bonds.keys()) + list(coupon_bonds.keys())))
+    if not all_isins:
+        return {"enriched_identity": 0, "enriched_reference": 0}
+
+    isin_filter = ",".join(all_isins)
+    _ensure_key()
+    enriched_identity = 0
+    enriched_reference = 0
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        # Fetch current local_bond_identity values
+        id_resp, ref_resp = await asyncio.gather(
+            client.get(
+                f"{SUPABASE_URL}/rest/v1/local_bond_identity",
+                headers=_headers(),
+                params={"isin": f"in.({isin_filter})", "select": "isin,maturity_date,coupon"},
+            ),
+            client.get(
+                f"{SUPABASE_URL}/rest/v1/local_bond_reference",
+                headers=_headers(),
+                params={"isin": f"in.({isin_filter})", "select": "isin,maturity_date,coupon,locked"},
+            ),
+        )
+
+    existing_id = {}
+    if not isinstance(id_resp, Exception) and id_resp.status_code == 200:
+        for r in id_resp.json():
+            existing_id[r["isin"]] = r
+
+    existing_ref = {}
+    if not isinstance(ref_resp, Exception) and ref_resp.status_code == 200:
+        for r in ref_resp.json():
+            existing_ref[r["isin"]] = r
+
+    import asyncio as _asyncio
+    patch_tasks = []
+
+    async def _patch(table: str, isin: str, payload: dict):
+        if not payload:
+            return 0
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.patch(
+                f"{SUPABASE_URL}/rest/v1/{table}",
+                headers={**_headers(), "Prefer": "return=minimal"},
+                params={"isin": f"eq.{isin}"},
+                json=payload,
+            )
+            if r.status_code not in (200, 204):
+                logger.warning("%s PATCH failed for %s: %s %s", table, isin, r.status_code, r.text[:200])
+                return 0
+            return 1
+
+    for isin in all_isins:
+        mat = maturity_date_bonds.get(isin)
+        coup = coupon_bonds.get(isin)
+
+        # local_bond_identity — update NULL fields, no locked check
+        cur_id = existing_id.get(isin, {})
+        id_patch = {}
+        if mat and not cur_id.get("maturity_date"):
+            id_patch["maturity_date"] = mat
+        if coup is not None and cur_id.get("coupon") is None:
+            id_patch["coupon"] = coup
+        if id_patch:
+            id_patch["synced_at"] = "now()"
+            if isin not in existing_id:
+                id_patch["isin"] = isin
+                patch_tasks.append(_upsert("local_bond_identity", [id_patch], "isin"))
+            else:
+                patch_tasks.append(_patch("local_bond_identity", isin, id_patch))
+
+        # local_bond_reference — update NULL fields only on unlocked rows
+        cur_ref = existing_ref.get(isin, {})
+        if cur_ref.get("locked"):
+            continue
+        ref_patch = {}
+        if mat and not cur_ref.get("maturity_date"):
+            ref_patch["maturity_date"] = mat
+        if coup is not None and cur_ref.get("coupon") is None:
+            ref_patch["coupon"] = coup
+        if ref_patch:
+            ref_patch["synced_at"] = "now()"
+            if isin not in existing_ref:
+                ref_patch["isin"] = isin
+                patch_tasks.append(_upsert("local_bond_reference", [ref_patch], "isin"))
+            else:
+                patch_tasks.append(_patch("local_bond_reference", isin, ref_patch))
+
+    if patch_tasks:
+        results = await _asyncio.gather(*patch_tasks, return_exceptions=True)
+        enriched = sum(1 for r in results if r and not isinstance(r, Exception))
+        logger.info("enrich_bond_data_from_bbg: %d patches applied for %d ISINs", enriched, len(all_isins))
+        return {"enriched": enriched, "isins": len(all_isins)}
+
+    logger.info("enrich_bond_data_from_bbg: nothing to enrich (all fields already populated)")
+    return {"enriched": 0, "isins": len(all_isins)}
+
+
 # ── Storage: upload raw files + track metadata ─────────────────────────────
 
 STORAGE_BUCKET = "recon-uploads"
