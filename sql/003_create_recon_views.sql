@@ -24,6 +24,7 @@ DROP VIEW IF EXISTS v_athena_bbg_accrued CASCADE;
 -- bbg_accrued  ← par × accrued_pct/100; fallback to stored accrued
 -- diff, diff_pct, par_mismatch
 -- day_count, frequency, last_coupon_date, days_accrued        ← diagnostic
+-- conv_hypothesis, conv_diff_per100                            ← iteration result
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE VIEW v_athena_bbg_accrued AS
 SELECT
@@ -59,7 +60,11 @@ SELECT
     ab.day_count,
     br.frequency,
     ab.last_coupon_date,
-    ab.days_accrued
+    ab.days_accrued,
+    -- Convention hypothesis: set when C+1 diff > 0.01/100 face after iterating all
+    -- day_count × frequency × offset combinations. NULL = current convention is correct.
+    ab.conv_hypothesis,
+    ab.conv_diff_per100
 FROM athena_bbg ab
 LEFT JOIN recon_bbg b USING (portfolio_id, date, isin)
 LEFT JOIN local_bond_identity bi ON bi.isin = ab.isin

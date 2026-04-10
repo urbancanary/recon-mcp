@@ -709,7 +709,7 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
         bbg_resp, athena_resp, ref_resp, holdings_resp = await asyncio.gather(
             client.get(f"{SUPABASE_URL}/rest/v1/recon_bbg", headers=_headers(), params={
                 "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
-                "select": "isin,par,price,accrued,maturity_date",
+                "select": "isin,par,price,accrued,accrued_pct,maturity_date",
             }),
             client.get(f"{SUPABASE_URL}/rest/v1/athena_bbg", headers=_headers(), params={
                 "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
@@ -784,16 +784,74 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
             lc = accrual_start
         days_acc = (trade_date - lc).days if lc else None
 
+        acc_t0 = _accrued_at(trade_date,                     *args, accrual_start=accrual_start)
+        acc_c1 = _accrued_at(trade_date + timedelta(days=1), *args, accrual_start=accrual_start)
+        acc_c2 = _accrued_at(trade_date + timedelta(days=2), *args, accrual_start=accrual_start)
+        acc_c3 = _accrued_at(trade_date + timedelta(days=3), *args, accrual_start=accrual_start)
+
+        # BBG reference accrued: prefer par × accrued_pct/100 (matches SQL view), fall back to stored accrued
+        bbg_pct = bbg.get("accrued_pct")
+        bbg_ref = (float(bbg_pct) * par / 100) if bbg_pct is not None else (float(bbg["accrued"]) if bbg.get("accrued") else None)
+
+        # Find which offset is closest to BBG — for diagnostic display
+        offset_candidates = [("T+0", acc_t0), ("C+1", acc_c1), ("C+2", acc_c2), ("C+3", acc_c3)]
+        if bbg_ref and par:
+            best_name, best_acc = min(
+                [(n, v) for n, v in offset_candidates if v is not None],
+                key=lambda x: abs(x[1] - bbg_ref), default=(None, None)
+            )
+            best_diff_per100 = abs(best_acc - bbg_ref) / par * 100 if best_acc is not None else None
+        else:
+            best_name, best_diff_per100 = None, None
+
+        # Convention diagnosis: if best offset is still off by >0.01 per 100 face,
+        # brute-force day_count × frequency × offset to find what would match BBG.
+        conv_hypothesis = None
+        conv_diff_per100 = None
+        if bbg_ref and par and best_diff_per100 is not None and best_diff_per100 > 0.01:
+            day_counts = ["30/360", "ACT/365", "ACT/ACT", "30E/360"]
+            freqs      = [1, 2]
+            best_hyp_diff = float("inf")
+            for dc_try in day_counts:
+                for freq_try in freqs:
+                    # Recompute coup_months for this frequency
+                    if freq_try == 1:
+                        cm_try = [mat.month]
+                    else:
+                        cm_try = sorted(set([(mat.month - 1) % 12 + 1, ((mat.month + 5) % 12) + 1]))
+                    freq_label = "Annual" if freq_try == 1 else "Semi"
+                    args_try = (coupon, freq_try, mat, cm_try, coup_day, dc_try, par)
+                    for offset in range(4):
+                        settle_try = trade_date + timedelta(days=offset)
+                        acc_try = _accrued_at(settle_try, *args_try, accrual_start=accrual_start)
+                        diff_try = abs(acc_try - bbg_ref) / par * 100
+                        if diff_try < best_hyp_diff:
+                            best_hyp_diff = diff_try
+                            offset_label = f"C+{offset}" if offset else "T+0"
+                            conv_hypothesis = f"{dc_try} {freq_label} {offset_label}"
+                            conv_diff_per100 = round(diff_try, 6)
+            # If hypothesis matches the current convention, clear it (no new info)
+            curr_dc  = "30/360" if "30" in day_count else day_count
+            curr_lbl = "Annual" if freq == 1 else "Semi"
+            if conv_hypothesis == f"{curr_dc} {curr_lbl} C+1":
+                conv_hypothesis = None
+            logger.debug(
+                "recalc_accrued: %s bbg_ref=%.4f best_c1_diff=%.4f/100 → hypothesis=%s diff=%.4f/100",
+                isin, bbg_ref, best_diff_per100, conv_hypothesis, conv_diff_per100 or 0,
+            )
+
         updated_rows.append({
             "isin": isin, "par": par, "source_price": price,
             "day_count": day_count if "30" not in day_count else "30/360",
             "last_coupon_date": lc.date().isoformat() if lc else None,
             "days_accrued": days_acc,
-            "accrued_t0": _accrued_at(trade_date,                     *args, accrual_start=accrual_start),
-            "accrued_c1": _accrued_at(trade_date + timedelta(days=1), *args, accrual_start=accrual_start),
-            "accrued_t1": _accrued_at(trade_date + timedelta(days=1), *args, accrual_start=accrual_start),
-            "accrued_c2": _accrued_at(trade_date + timedelta(days=2), *args, accrual_start=accrual_start),
-            "accrued_c3": _accrued_at(trade_date + timedelta(days=3), *args, accrual_start=accrual_start),
+            "accrued_t0": acc_t0,
+            "accrued_c1": acc_c1,
+            "accrued_t1": acc_c1,   # T+1 same as C+1 (BBG uses raw calendar, no business-day roll)
+            "accrued_c2": acc_c2,
+            "accrued_c3": acc_c3,
+            "conv_hypothesis":  conv_hypothesis,
+            "conv_diff_per100": conv_diff_per100,
         })
 
     if updated_rows:
@@ -801,10 +859,26 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
                       [{"portfolio_id": portfolio_id, "date": date, **r} for r in updated_rows],
                       "portfolio_id,date,isin")
 
-    logger.info(f"recalc_accrued: {portfolio_id}/{date} → {len(updated_rows)} updated, {len(skipped)} skipped")
-    return {"recalculated": len(updated_rows), "checked": len(needs_recalc),
-            "skipped": skipped,
-            "bonds": [{"isin": r["isin"], "accrued_c1": r["accrued_c1"]} for r in updated_rows]}
+    n_hypothesis = sum(1 for r in updated_rows if r.get("conv_hypothesis"))
+    logger.info(
+        "recalc_accrued: %s/%s → %d updated, %d skipped, %d with convention hypothesis",
+        portfolio_id, date, len(updated_rows), len(skipped), n_hypothesis,
+    )
+    return {
+        "recalculated": len(updated_rows),
+        "checked": len(needs_recalc),
+        "skipped": skipped,
+        "convention_hypotheses": n_hypothesis,
+        "bonds": [
+            {
+                "isin": r["isin"],
+                "accrued_c1": r["accrued_c1"],
+                **({"conv_hypothesis": r["conv_hypothesis"], "conv_diff_per100": r["conv_diff_per100"]}
+                   if r.get("conv_hypothesis") else {}),
+            }
+            for r in updated_rows
+        ],
+    }
 
 
 # ── High-level upload handlers ──────────────────────────────────────────────
