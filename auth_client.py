@@ -14,7 +14,9 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-ORCA_URL = os.environ.get("ORCA_URL", "https://orca-gateway-production.up.railway.app")
+ORCA_URL = os.environ.get("ORCA_URL", "")
+if not ORCA_URL:
+    raise RuntimeError("Configuration missing")
 _CACHE_TTL = 300  # 5 minutes
 _cache: dict[str, tuple[str, float]] = {}  # key -> (value, expiry)
 
