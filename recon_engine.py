@@ -984,6 +984,25 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
         acc_c2 = _accrued_at(trade_date + timedelta(days=2), *args, accrual_start=accrual_start, bdc=bdc, currency=currency)
         acc_c3 = _accrued_at(trade_date + timedelta(days=3), *args, accrual_start=accrual_start, bdc=bdc, currency=currency)
 
+        # Business-day-adjusted T+1/T+2/T+3 — step forward skipping weekends
+        # and (for CNY/CNH bonds) the CNY holiday calendar via _is_non_business.
+        # For most USD bonds the weekend roll is what matters; for mainland /
+        # HK CNY bonds we skip Chinese New Year / Golden Week / etc.
+        def _advance_business_days(start, n):
+            cur = start
+            added = 0
+            while added < n:
+                cur = cur + timedelta(days=1)
+                if not _is_non_business(cur, currency):
+                    added += 1
+            return cur
+        t1_date = _advance_business_days(trade_date, 1)
+        t2_date = _advance_business_days(trade_date, 2)
+        t3_date = _advance_business_days(trade_date, 3)
+        acc_t1 = _accrued_at(t1_date, *args, accrual_start=accrual_start, bdc=bdc, currency=currency)
+        acc_t2 = _accrued_at(t2_date, *args, accrual_start=accrual_start, bdc=bdc, currency=currency)
+        acc_t3 = _accrued_at(t3_date, *args, accrual_start=accrual_start, bdc=bdc, currency=currency)
+
         # BBG reference accrued: prefer par × accrued_pct/100 (matches SQL view), fall back to stored accrued
         bbg_pct = bbg.get("accrued_pct")
         bbg_ref = (float(bbg_pct) * par / 100) if bbg_pct is not None else (float(bbg["accrued"]) if bbg.get("accrued") else None)
@@ -1042,7 +1061,11 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
             "days_accrued": days_acc,
             "accrued_t0": acc_t0,
             "accrued_c1": acc_c1,
-            "accrued_t1": acc_c1,   # T+1 same as C+1 (BBG uses raw calendar, no business-day roll)
+            # T+1/T+2/T+3 now business-day-adjusted (skip weekends + CNY holidays)
+            # rather than duplicating calendar offsets.
+            "accrued_t1": acc_t1,
+            "accrued_t2": acc_t2,
+            "accrued_t3": acc_t3,
             "accrued_c2": acc_c2,
             "accrued_c3": acc_c3,
             "conv_hypothesis":  conv_hypothesis,
