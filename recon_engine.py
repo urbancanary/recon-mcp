@@ -803,7 +803,7 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
         return round(per100 * par / 100, 6)
 
     async with httpx.AsyncClient(timeout=15) as client:
-        bbg_resp, athena_resp, ref_resp, holdings_resp = await asyncio.gather(
+        bbg_resp, athena_resp, ref_resp, holdings_resp, maia_resp, admin_resp = await asyncio.gather(
             client.get(f"{SUPABASE_URL}/rest/v1/recon_bbg", headers=_headers(), params={
                 "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
                 "select": "isin,par,price,accrued,accrued_pct,maturity_date",
@@ -818,12 +818,57 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
             client.get(f"{SUPABASE_URL}/rest/v1/orca_holdings", headers=_headers(), params={
                 "portfolio_id": f"eq.{portfolio_id}", "select": "isin,par_amount",
             }),
+            # Fall-back sources when recon_bbg is empty for the date (e.g.
+            # triggering a recalc against a maia or admin-only date so the
+            # maia recon view has athena_bbg rows with gap=0).
+            client.get(f"{SUPABASE_URL}/rest/v1/recon_maia", headers=_headers(), params={
+                "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
+                "select": "isin,par,price,maturity_date",
+            }),
+            client.get(f"{SUPABASE_URL}/rest/v1/recon_admin", headers=_headers(), params={
+                "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
+                "select": "isin,par,price",
+            }),
         )
 
     bbg_bonds    = {r["isin"]: r for r in (bbg_resp.json()      if bbg_resp.status_code      == 200 else [])}
     athena_map   = {r["isin"]: r for r in (athena_resp.json()   if athena_resp.status_code   == 200 else [])}
     ref_map      = {r["isin"]: r for r in (ref_resp.json()      if ref_resp.status_code      == 200 else [])}
     holdings_map = {r["isin"]: float(r["par_amount"]) for r in (holdings_resp.json() if holdings_resp.status_code == 200 else []) if r.get("par_amount")}
+    maia_bonds   = {r["isin"]: r for r in (maia_resp.json()     if maia_resp.status_code     == 200 else [])}
+    admin_bonds  = {r["isin"]: r for r in (admin_resp.json()    if admin_resp.status_code    == 200 else [])}
+
+    # If recon_bbg has no rows for this date, fall back to maia then admin as
+    # the position/price source. This lets the same recalc_accrued code path
+    # populate athena_bbg for maia-only dates so the v_athena_maia_accrued
+    # view can join at gap=0 and expose all four T+x offsets.
+    if not bbg_bonds and maia_bonds:
+        logger.info("recalc_accrued: no recon_bbg for %s/%s — falling back to recon_maia (%d bonds)",
+                    portfolio_id, date, len(maia_bonds))
+        bbg_bonds = {
+            isin: {
+                "isin": isin,
+                "par": r.get("par"),
+                "price": r.get("price"),
+                "maturity_date": r.get("maturity_date"),
+                "accrued": None,
+                "accrued_pct": None,
+            }
+            for isin, r in maia_bonds.items() if r.get("par") is not None
+        }
+    elif not bbg_bonds and admin_bonds:
+        logger.info("recalc_accrued: no recon_bbg for %s/%s — falling back to recon_admin (%d bonds)",
+                    portfolio_id, date, len(admin_bonds))
+        bbg_bonds = {
+            isin: {
+                "isin": isin,
+                "par": r.get("par"),
+                "price": r.get("price"),
+                "accrued": None,
+                "accrued_pct": None,
+            }
+            for isin, r in admin_bonds.items() if r.get("par") is not None
+        }
 
     # Fetch coupon + business_day_convention from bond_identity, filtered to only
     # the ISINs we care about. Without the filter, PostgREST caps the response at
