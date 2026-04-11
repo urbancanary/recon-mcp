@@ -183,7 +183,7 @@ async def sync_bond_data(isins: list[str] = None) -> dict:
             headers=bdh,
             params={
                 "isin": f"in.({isin_filter})",
-                "select": "isin,branded_description,branded_ticker,issuer_description,coupon,maturity_date",
+                "select": "isin,branded_description,branded_ticker,issuer_description,coupon,maturity_date,business_day_convention",
             },
         )
         reference_req = client.get(
@@ -365,9 +365,6 @@ async def enrich_bond_data_from_bbg(
         # ALWAYS overwrite day_count with BBG value (authoritative)
         if day_count_val is not None:
             ref_patch["day_count"] = day_count_val
-        # Only fill coupon if currently NULL
-        if coup is not None and cur_ref.get("coupon") is None:
-            ref_patch["coupon"] = coup
         if ref_patch:
             ref_patch["synced_at"] = "now()"
             if isin not in existing_ref:

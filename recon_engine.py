@@ -8,6 +8,7 @@ This is the business logic layer that sits between the HTTP endpoints
 (app.py) and the data layer (recon_db.py).
 """
 
+import hashlib
 import logging
 import os
 import re
@@ -18,7 +19,7 @@ from recon_db import (
     store_bbg, store_admin, store_maia, store_calcs, store_athena_bbg,
     store_raw_upload, lookup_bond_reference, sync_bond_data, sync_orca_holdings,
     enrich_bond_data_from_bbg,
-    SUPABASE_URL, _headers,
+    SUPABASE_URL, _headers, BOND_DATA_URL, _bond_data_headers,
 )
 from alerts import (
     alert_ga10_partial_failure, alert_upload_failed,
@@ -653,9 +654,29 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
     via the /recalc/accrued HTTP endpoint.
     """
     from datetime import datetime, timedelta
-    from recon_db import SUPABASE_URL, _headers, _upsert
+    from recon_db import SUPABASE_URL, _headers, _upsert, BOND_DATA_URL, _bond_data_headers
 
-    def _last_coupon_before(settle, coup_months, coup_day):
+    def _adjust_bdc(dt, bdc):
+        """Apply business day convention using weekend-only calendar."""
+        if not bdc or bdc == 'Unadjusted':
+            return dt
+        wd = dt.weekday()  # 0=Mon … 5=Sat, 6=Sun
+        if wd <= 4:
+            return dt  # already a business day
+        offset = 2 if wd == 5 else 1  # Sat→+2, Sun→+1 to get Monday
+        following = dt + timedelta(days=offset)
+        if bdc == 'Following':
+            return following
+        # ModifiedFollowing: if Monday spills into next month, use preceding Friday instead
+        if bdc == 'ModifiedFollowing':
+            if following.month != dt.month:
+                return dt - timedelta(days=wd - 4)  # back to Friday
+            return following
+        if bdc == 'Preceding':
+            return dt - timedelta(days=wd - 4)  # back to Friday
+        return dt
+
+    def _last_coupon_before(settle, coup_months, coup_day, bdc='Unadjusted'):
         last_coupon = None
         for y in [settle.year, settle.year - 1]:
             for m in sorted(coup_months, reverse=True):
@@ -663,6 +684,7 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
                     cd = datetime(y, m, coup_day)
                 except ValueError:
                     cd = datetime(y, m, 28)
+                cd = _adjust_bdc(cd, bdc)
                 if cd < settle:
                     if last_coupon is None or cd > last_coupon:
                         last_coupon = cd
@@ -670,8 +692,8 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
         return last_coupon
 
     def _accrued_at(settle, coupon, freq, mat, coup_months, coup_day, day_count, par,
-                    accrual_start=None):
-        last_coupon = _last_coupon_before(settle, coup_months, coup_day)
+                    accrual_start=None, bdc='Unadjusted'):
+        last_coupon = _last_coupon_before(settle, coup_months, coup_day, bdc)
         if last_coupon and accrual_start and last_coupon < accrual_start:
             last_coupon = accrual_start
         # Phantom coupon: coup_day arithmetic can land just after issue date — discard it
@@ -689,7 +711,10 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
             days = (settle.year - last_coupon.year) * 360 + (settle.month - last_coupon.month) * 30 + (d2 - d1)
             per100 = coupon / freq * days / (360 / freq)
         elif "365" in day_count:
-            per100 = coupon / freq * (settle - last_coupon).days / 365
+            # Chinese bond (PBOC/NAFMII) convention: accrue at full annual rate / 365,
+            # regardless of payment frequency (semi-annual bonds do NOT divide coupon by 2).
+            accrual_freq = 1 if freq == 2 else freq
+            per100 = coupon / accrual_freq * (settle - last_coupon).days / 365
         else:
             actual = (settle - last_coupon).days
             nc = None
@@ -706,36 +731,71 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
         return round(per100 * par / 100, 6)
 
     async with httpx.AsyncClient(timeout=15) as client:
-        bbg_resp, athena_resp, ref_resp, holdings_resp = await asyncio.gather(
+        bbg_resp, athena_resp, ref_resp, holdings_resp, identity_resp = await asyncio.gather(
             client.get(f"{SUPABASE_URL}/rest/v1/recon_bbg", headers=_headers(), params={
                 "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
                 "select": "isin,par,price,accrued,accrued_pct,maturity_date",
             }),
             client.get(f"{SUPABASE_URL}/rest/v1/athena_bbg", headers=_headers(), params={
                 "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
-                "select": "isin,par,accrued_c1,source_price",
+                "select": "isin,par,accrued_c1,source_price,static_hash",
             }),
             client.get(f"{SUPABASE_URL}/rest/v1/local_bond_reference", headers=_headers(), params={
-                "select": "isin,coupon,maturity_date,day_count,frequency,accrual_date",
+                "select": "isin,maturity_date,day_count,frequency,accrual_date",
             }),
             client.get(f"{SUPABASE_URL}/rest/v1/orca_holdings", headers=_headers(), params={
                 "portfolio_id": f"eq.{portfolio_id}", "select": "isin,par_amount",
             }),
+            client.get(f"{BOND_DATA_URL}/rest/v1/bond_identity", headers=_bond_data_headers(), params={
+                "select": "isin,coupon,business_day_convention",
+            }),
         )
 
-    bbg_bonds   = {r["isin"]: r for r in (bbg_resp.json()      if bbg_resp.status_code      == 200 else [])}
-    athena_map  = {r["isin"]: r for r in (athena_resp.json()   if athena_resp.status_code   == 200 else [])}
-    ref_map     = {r["isin"]: r for r in (ref_resp.json()      if ref_resp.status_code      == 200 else [])}
+    bbg_bonds    = {r["isin"]: r for r in (bbg_resp.json()      if bbg_resp.status_code      == 200 else [])}
+    athena_map   = {r["isin"]: r for r in (athena_resp.json()   if athena_resp.status_code   == 200 else [])}
+    ref_map      = {r["isin"]: r for r in (ref_resp.json()      if ref_resp.status_code      == 200 else [])}
     holdings_map = {r["isin"]: float(r["par_amount"]) for r in (holdings_resp.json() if holdings_resp.status_code == 200 else []) if r.get("par_amount")}
+    # Merge coupon + business_day_convention from bond_identity (canonical source) into ref_map
+    for r in (identity_resp.json() if identity_resp.status_code == 200 else []):
+        if r["isin"] in ref_map:
+            if r.get("coupon") is not None:
+                ref_map[r["isin"]]["coupon"] = float(r["coupon"])
+            ref_map[r["isin"]]["bdc"] = r.get("business_day_convention") or "Unadjusted"
 
     trade_date = datetime.strptime(date, "%Y-%m-%d")
-    needs_recalc = list(bbg_bonds) if force else [
+
+    def _static_hash(ref: dict) -> str:
+        """Short hash of the static inputs that drive accrued calculation.
+        If this differs from the stored value, recalc is forced even if numbers look fine."""
+        parts = "|".join([
+            str(ref.get("day_count") or ""),
+            str(ref.get("frequency") or ""),
+            str(ref.get("coupon") or ""),
+            str(ref.get("maturity_date") or ""),
+            str(ref.get("accrual_date") or ""),
+            str(ref.get("bdc") or "Unadjusted"),
+        ])
+        return hashlib.md5(parts.encode()).hexdigest()[:16]
+
+    # Detect bonds whose static convention data has changed since last recalc
+    current_hashes = {isin: _static_hash(ref_map[isin]) for isin in bbg_bonds if isin in ref_map}
+    hash_changed = {
+        isin for isin, h in current_hashes.items()
+        if athena_map.get(isin, {}).get("static_hash") != h
+    }
+    if hash_changed and not force:
+        logger.info(
+            "recalc_accrued: %d bond(s) have changed static data → forcing recalc: %s",
+            len(hash_changed), sorted(hash_changed),
+        )
+
+    needs_recalc = list(bbg_bonds) if force else list({
         isin for isin, bbg in bbg_bonds.items()
         if (athena_map.get(isin, {}).get("accrued_c1") is None
             or bbg.get("accrued") is None
             or (bbg["accrued"] != 0
                 and abs((athena_map[isin]["accrued_c1"] - bbg["accrued"]) / bbg["accrued"]) > 0.0001))
-    ]
+    } | hash_changed)
 
     if not needs_recalc:
         return {"recalculated": 0, "message": "All bonds already match BBG"}
@@ -775,19 +835,20 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
 
         accrual_date_str = ref.get("accrual_date")
         accrual_start = datetime.strptime(accrual_date_str[:10], "%Y-%m-%d") if accrual_date_str else None
+        bdc = ref.get("bdc") or "Unadjusted"
 
         args = (coupon, freq, mat, coup_months, coup_day, day_count, par)
-        lc = _last_coupon_before(trade_date, coup_months, coup_day)
+        lc = _last_coupon_before(trade_date, coup_months, coup_day, bdc)
         if lc and accrual_start and lc < accrual_start:
             lc = accrual_start
         if lc and accrual_start and lc >= accrual_start and (lc - accrual_start).days < 30:
             lc = accrual_start
         days_acc = (trade_date - lc).days if lc else None
 
-        acc_t0 = _accrued_at(trade_date,                     *args, accrual_start=accrual_start)
-        acc_c1 = _accrued_at(trade_date + timedelta(days=1), *args, accrual_start=accrual_start)
-        acc_c2 = _accrued_at(trade_date + timedelta(days=2), *args, accrual_start=accrual_start)
-        acc_c3 = _accrued_at(trade_date + timedelta(days=3), *args, accrual_start=accrual_start)
+        acc_t0 = _accrued_at(trade_date,                     *args, accrual_start=accrual_start, bdc=bdc)
+        acc_c1 = _accrued_at(trade_date + timedelta(days=1), *args, accrual_start=accrual_start, bdc=bdc)
+        acc_c2 = _accrued_at(trade_date + timedelta(days=2), *args, accrual_start=accrual_start, bdc=bdc)
+        acc_c3 = _accrued_at(trade_date + timedelta(days=3), *args, accrual_start=accrual_start, bdc=bdc)
 
         # BBG reference accrued: prefer par × accrued_pct/100 (matches SQL view), fall back to stored accrued
         bbg_pct = bbg.get("accrued_pct")
@@ -852,6 +913,7 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
             "accrued_c3": acc_c3,
             "conv_hypothesis":  conv_hypothesis,
             "conv_diff_per100": conv_diff_per100,
+            "static_hash": current_hashes.get(isin),
         })
 
     if updated_rows:
