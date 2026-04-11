@@ -753,7 +753,9 @@ async def _fetch_independent_athena_prices(isins: list[str], recon_date: str) ->
     if cached and (time.time() - cached[0]) < _ATHENA_PRICE_TTL:
         return cached[1]
 
-    ga10_url = os.environ.get("GA10_PRICING_URL", "https://ga10-pricing.urbancanary.workers.dev")
+    ga10_url = os.environ.get("GA10_PRICING_URL", "")
+    if not ga10_url:
+        raise RuntimeError("Configuration missing")
 
     try:
         start = datetime.strptime(recon_date, "%Y-%m-%d")

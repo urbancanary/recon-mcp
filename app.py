@@ -381,7 +381,7 @@ async def recon_view_query(view_name: str, portfolio_id: str = "wnbf", date: str
                     )
                     # CBonds/GA10 prices from ga10-pricing (non-BBG source for recon date)
                     import os
-                    ga10_url = os.environ.get("GA10_PRICING_URL", "https://ga10-pricing.urbancanary.workers.dev")
+                    ga10_url = os.environ.get("GA10_PRICING_URL", "")
                     cb_task = ind_client.get(f"{ga10_url}/prices/by-date?date={date}")
 
                     import asyncio
@@ -620,7 +620,7 @@ async def recalc_single_bond(isin: str, date: str, portfolio_id: str = "wnbf"):
     from datetime import datetime, timedelta
     from recon_db import SUPABASE_URL, _headers, store_calcs, _upsert
 
-    gw_url = os.environ.get("GA10_GATEWAY_URL", "https://ga10-gateway.urbancanary.workers.dev")
+    gw_url = os.environ.get("GA10_GATEWAY_URL", "")
 
     # Get BBG data for this bond (price + par)
     async with httpx.AsyncClient(timeout=45) as client:
@@ -763,8 +763,8 @@ async def athena_v_ga10(portfolio_id: str = "wnbf", date: str = None):
     import httpx
     import asyncio
 
-    ga10_url = os.environ.get("GA10_PRICING_URL", "https://ga10-pricing.urbancanary.workers.dev")
-    gw_url = os.environ.get("GA10_GATEWAY_URL", "https://ga10-gateway.urbancanary.workers.dev")
+    ga10_url = os.environ.get("GA10_PRICING_URL", "")
+    gw_url = os.environ.get("GA10_GATEWAY_URL", "")
     # Use v3 until v4 is deployed on the gateway, then switch via env var
     gw_version = os.environ.get("GA10_RECON_VERSION", "v3")
 
@@ -986,7 +986,7 @@ async def recalc_portfolio(portfolio_id: str = "gcrif", date: str = None):
     if not date:
         raise HTTPException(status_code=400, detail="date parameter required")
 
-    gw_url = os.environ.get("GA10_GATEWAY_URL", "https://ga10-gateway.urbancanary.workers.dev")
+    gw_url = os.environ.get("GA10_GATEWAY_URL", "")
     d0 = dt.strptime(date, "%Y-%m-%d").date()
 
     # Settlement offsets: T+0 = same day, then +1, +2, +3 calendar days

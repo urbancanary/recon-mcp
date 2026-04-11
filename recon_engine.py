@@ -28,7 +28,9 @@ from alerts import (
 
 logger = logging.getLogger(__name__)
 
-GA10_PRICING_URL = os.environ.get("GA10_PRICING_URL", "https://ga10-pricing.urbancanary.workers.dev")
+GA10_PRICING_URL = os.environ.get("GA10_PRICING_URL", "")
+if not GA10_PRICING_URL:
+    raise RuntimeError("Configuration missing")
 
 ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")
 MAIA_DATE_RE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$")
