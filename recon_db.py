@@ -99,7 +99,9 @@ async def lookup_bond_reference(isins: list[str]) -> dict[str, dict]:
 # ── Sync: Orca holdings → orca_holdings table ────────────────────────────────
 # Recon views join orca_holdings for Athena Par (the actual holding, not BBG nominal).
 
-ORCA_MCP_URL = os.environ.get("ORCA_MCP_URL", "https://orca-mcp-production.up.railway.app")
+ORCA_MCP_URL = os.environ.get("ORCA_MCP_URL", "")
+if not ORCA_MCP_URL:
+    raise RuntimeError("Configuration missing")
 
 
 async def sync_orca_holdings(portfolio_id: str = "wnbf") -> dict:
