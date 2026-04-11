@@ -731,7 +731,7 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
         return round(per100 * par / 100, 6)
 
     async with httpx.AsyncClient(timeout=15) as client:
-        bbg_resp, athena_resp, ref_resp, holdings_resp, identity_resp = await asyncio.gather(
+        bbg_resp, athena_resp, ref_resp, holdings_resp = await asyncio.gather(
             client.get(f"{SUPABASE_URL}/rest/v1/recon_bbg", headers=_headers(), params={
                 "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
                 "select": "isin,par,price,accrued,accrued_pct,maturity_date",
@@ -746,21 +746,37 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
             client.get(f"{SUPABASE_URL}/rest/v1/orca_holdings", headers=_headers(), params={
                 "portfolio_id": f"eq.{portfolio_id}", "select": "isin,par_amount",
             }),
-            client.get(f"{BOND_DATA_URL}/rest/v1/bond_identity", headers=_bond_data_headers(), params={
-                "select": "isin,coupon,business_day_convention",
-            }),
         )
 
     bbg_bonds    = {r["isin"]: r for r in (bbg_resp.json()      if bbg_resp.status_code      == 200 else [])}
     athena_map   = {r["isin"]: r for r in (athena_resp.json()   if athena_resp.status_code   == 200 else [])}
     ref_map      = {r["isin"]: r for r in (ref_resp.json()      if ref_resp.status_code      == 200 else [])}
     holdings_map = {r["isin"]: float(r["par_amount"]) for r in (holdings_resp.json() if holdings_resp.status_code == 200 else []) if r.get("par_amount")}
-    # Merge coupon + business_day_convention from bond_identity (canonical source) into ref_map
-    for r in (identity_resp.json() if identity_resp.status_code == 200 else []):
-        if r["isin"] in ref_map:
-            if r.get("coupon") is not None:
-                ref_map[r["isin"]]["coupon"] = float(r["coupon"])
-            ref_map[r["isin"]]["bdc"] = r.get("business_day_convention") or "Unadjusted"
+
+    # Fetch coupon + business_day_convention from bond_identity, filtered to only
+    # the ISINs we care about. Without the filter, PostgREST caps the response at
+    # 1000 rows (bond_identity has ~33k), so most HK/XS bonds get silently dropped
+    # and fall through to "missing reference data" — which is exactly the bug
+    # that caused CNY accrued diffs to persist after the ACT/365 fix was deployed.
+    bbg_isins = list(bbg_bonds.keys())
+    if bbg_isins:
+        async with httpx.AsyncClient(timeout=15) as client:
+            identity_resp = await client.get(
+                f"{BOND_DATA_URL}/rest/v1/bond_identity",
+                headers=_bond_data_headers(),
+                params={
+                    "isin": f"in.({','.join(bbg_isins)})",
+                    "select": "isin,coupon,business_day_convention",
+                },
+            )
+        if identity_resp.status_code == 200:
+            for r in identity_resp.json():
+                # Ensure ref entry exists even if local_bond_reference lacks this ISIN
+                if r["isin"] not in ref_map:
+                    ref_map[r["isin"]] = {"isin": r["isin"]}
+                if r.get("coupon") is not None:
+                    ref_map[r["isin"]]["coupon"] = float(r["coupon"])
+                ref_map[r["isin"]]["bdc"] = r.get("business_day_convention") or "Unadjusted"
 
     trade_date = datetime.strptime(date, "%Y-%m-%d")
 
