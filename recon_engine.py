@@ -656,27 +656,99 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
     from datetime import datetime, timedelta
     from recon_db import SUPABASE_URL, _headers, _upsert, BOND_DATA_URL, _bond_data_headers
 
-    def _adjust_bdc(dt, bdc):
-        """Apply business day convention using weekend-only calendar."""
+    # Bloomberg CDR CNH Currency calendar, ported from
+    # json_receiver_project/google_analysis10/google_analysis10.py:_add_china_holidays.
+    # Source: State Council announcements, mirrored by Bloomberg.
+    # Update this list each December when the State Council announces the next year.
+    # Needed because QuantLib's China(IB) calendar also lacks future holidays and
+    # recon-mcp doesn't use QuantLib at all.
+    _CNY_HOLIDAYS = frozenset([
+        # 2025
+        (2025, 1, 1),
+        (2025, 1, 28), (2025, 1, 29), (2025, 1, 30), (2025, 1, 31),
+        (2025, 2, 1), (2025, 2, 2), (2025, 2, 3), (2025, 2, 4),
+        (2025, 4, 4), (2025, 4, 5),
+        (2025, 5, 1), (2025, 5, 2), (2025, 5, 5),
+        (2025, 5, 31),
+        (2025, 10, 1), (2025, 10, 2), (2025, 10, 3), (2025, 10, 6), (2025, 10, 7),
+        # 2026
+        (2026, 1, 1), (2026, 1, 2),
+        (2026, 2, 16), (2026, 2, 17), (2026, 2, 18), (2026, 2, 19),
+        (2026, 2, 20), (2026, 2, 23),
+        (2026, 4, 3), (2026, 4, 4), (2026, 4, 7),
+        (2026, 5, 1), (2026, 5, 4), (2026, 5, 5),
+        (2026, 5, 25),
+        (2026, 6, 19),
+        (2026, 7, 1),
+        (2026, 9, 25), (2026, 9, 26),
+        (2026, 10, 1), (2026, 10, 2), (2026, 10, 5), (2026, 10, 6), (2026, 10, 7),
+        # 2027
+        (2027, 1, 1),
+        (2027, 2, 5), (2027, 2, 8), (2027, 2, 9),
+        (2027, 2, 10), (2027, 2, 11), (2027, 2, 12),
+        (2027, 3, 26), (2027, 3, 27), (2027, 3, 29),
+        (2027, 4, 5),
+        (2027, 5, 1), (2027, 5, 3), (2027, 5, 4), (2027, 5, 5),
+        (2027, 5, 13),
+        (2027, 6, 9),
+        (2027, 7, 1),
+        (2027, 9, 15), (2027, 9, 16),
+        (2027, 10, 1), (2027, 10, 2),
+        # 2028
+        (2028, 1, 3),
+        (2028, 1, 24), (2028, 1, 25), (2028, 1, 26), (2028, 1, 27),
+        (2028, 1, 28), (2028, 1, 31),
+        (2028, 4, 3), (2028, 4, 4),
+        (2028, 4, 14), (2028, 4, 15), (2028, 4, 17),
+        (2028, 5, 1), (2028, 5, 2), (2028, 5, 3), (2028, 5, 4), (2028, 5, 5),
+        (2028, 5, 29),
+        (2028, 7, 1),
+        (2028, 10, 1), (2028, 10, 2),
+    ])
+
+    def _is_non_business(dt, currency):
+        """Weekend-or-CNY-holiday check. CNY calendar only applies to CNY/CNH bonds."""
+        if dt.weekday() >= 5:
+            return True
+        if currency in ('CNY', 'CNH') and (dt.year, dt.month, dt.day) in _CNY_HOLIDAYS:
+            return True
+        return False
+
+    def _adjust_bdc(dt, bdc, currency=None):
+        """Apply business day convention. Rolls past weekends, and past Bloomberg
+        CDR CNH holidays when the bond is in CNY/CNH."""
         if not bdc or bdc == 'Unadjusted':
             return dt
-        wd = dt.weekday()  # 0=Mon … 5=Sat, 6=Sun
-        if wd <= 4:
-            return dt  # already a business day
-        offset = 2 if wd == 5 else 1  # Sat→+2, Sun→+1 to get Monday
-        following = dt + timedelta(days=offset)
+        if not _is_non_business(dt, currency):
+            return dt
+        # Walk forward up to 14 days to find the next business day
+        following = dt
+        for _ in range(14):
+            following = following + timedelta(days=1)
+            if not _is_non_business(following, currency):
+                break
         if bdc == 'Following':
             return following
-        # ModifiedFollowing: if Monday spills into next month, use preceding Friday instead
         if bdc == 'ModifiedFollowing':
+            # Spill into next month → roll backward from dt instead
             if following.month != dt.month:
-                return dt - timedelta(days=wd - 4)  # back to Friday
+                preceding = dt
+                for _ in range(14):
+                    preceding = preceding - timedelta(days=1)
+                    if not _is_non_business(preceding, currency):
+                        return preceding
+                return dt
             return following
         if bdc == 'Preceding':
-            return dt - timedelta(days=wd - 4)  # back to Friday
+            preceding = dt
+            for _ in range(14):
+                preceding = preceding - timedelta(days=1)
+                if not _is_non_business(preceding, currency):
+                    return preceding
+            return dt
         return dt
 
-    def _last_coupon_before(settle, coup_months, coup_day, bdc='Unadjusted'):
+    def _last_coupon_before(settle, coup_months, coup_day, bdc='Unadjusted', currency=None):
         last_coupon = None
         for y in [settle.year, settle.year - 1]:
             for m in sorted(coup_months, reverse=True):
@@ -684,7 +756,7 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
                     cd = datetime(y, m, coup_day)
                 except ValueError:
                     cd = datetime(y, m, 28)
-                cd = _adjust_bdc(cd, bdc)
+                cd = _adjust_bdc(cd, bdc, currency)
                 if cd < settle:
                     if last_coupon is None or cd > last_coupon:
                         last_coupon = cd
@@ -692,8 +764,8 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
         return last_coupon
 
     def _accrued_at(settle, coupon, freq, mat, coup_months, coup_day, day_count, par,
-                    accrual_start=None, bdc='Unadjusted'):
-        last_coupon = _last_coupon_before(settle, coup_months, coup_day, bdc)
+                    accrual_start=None, bdc='Unadjusted', currency=None):
+        last_coupon = _last_coupon_before(settle, coup_months, coup_day, bdc, currency)
         if last_coupon and accrual_start and last_coupon < accrual_start:
             last_coupon = accrual_start
         # Phantom coupon: coup_day arithmetic can land just after issue date — discard it
@@ -741,7 +813,7 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
                 "select": "isin,par,accrued_c1,source_price,static_hash",
             }),
             client.get(f"{SUPABASE_URL}/rest/v1/local_bond_reference", headers=_headers(), params={
-                "select": "isin,maturity_date,day_count,frequency,accrual_date",
+                "select": "isin,currency,maturity_date,day_count,frequency,accrual_date",
             }),
             client.get(f"{SUPABASE_URL}/rest/v1/orca_holdings", headers=_headers(), params={
                 "portfolio_id": f"eq.{portfolio_id}", "select": "isin,par_amount",
@@ -852,19 +924,20 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
         accrual_date_str = ref.get("accrual_date")
         accrual_start = datetime.strptime(accrual_date_str[:10], "%Y-%m-%d") if accrual_date_str else None
         bdc = ref.get("bdc") or "Unadjusted"
+        currency = ref.get("currency")
 
         args = (coupon, freq, mat, coup_months, coup_day, day_count, par)
-        lc = _last_coupon_before(trade_date, coup_months, coup_day, bdc)
+        lc = _last_coupon_before(trade_date, coup_months, coup_day, bdc, currency)
         if lc and accrual_start and lc < accrual_start:
             lc = accrual_start
         if lc and accrual_start and lc >= accrual_start and (lc - accrual_start).days < 30:
             lc = accrual_start
         days_acc = (trade_date - lc).days if lc else None
 
-        acc_t0 = _accrued_at(trade_date,                     *args, accrual_start=accrual_start, bdc=bdc)
-        acc_c1 = _accrued_at(trade_date + timedelta(days=1), *args, accrual_start=accrual_start, bdc=bdc)
-        acc_c2 = _accrued_at(trade_date + timedelta(days=2), *args, accrual_start=accrual_start, bdc=bdc)
-        acc_c3 = _accrued_at(trade_date + timedelta(days=3), *args, accrual_start=accrual_start, bdc=bdc)
+        acc_t0 = _accrued_at(trade_date,                     *args, accrual_start=accrual_start, bdc=bdc, currency=currency)
+        acc_c1 = _accrued_at(trade_date + timedelta(days=1), *args, accrual_start=accrual_start, bdc=bdc, currency=currency)
+        acc_c2 = _accrued_at(trade_date + timedelta(days=2), *args, accrual_start=accrual_start, bdc=bdc, currency=currency)
+        acc_c3 = _accrued_at(trade_date + timedelta(days=3), *args, accrual_start=accrual_start, bdc=bdc, currency=currency)
 
         # BBG reference accrued: prefer par × accrued_pct/100 (matches SQL view), fall back to stored accrued
         bbg_pct = bbg.get("accrued_pct")
@@ -900,7 +973,7 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
                     args_try = (coupon, freq_try, mat, cm_try, coup_day, dc_try, par)
                     for offset in range(4):
                         settle_try = trade_date + timedelta(days=offset)
-                        acc_try = _accrued_at(settle_try, *args_try, accrual_start=accrual_start)
+                        acc_try = _accrued_at(settle_try, *args_try, accrual_start=accrual_start, bdc=bdc, currency=currency)
                         diff_try = abs(acc_try - bbg_ref) / par * 100
                         if diff_try < best_hyp_diff:
                             best_hyp_diff = diff_try
