@@ -10,7 +10,7 @@ import asyncio
 import logging
 from datetime import datetime
 
-from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 from recon_db import (
@@ -505,6 +505,72 @@ async def recalc_accrued_endpoint(portfolio_id: str = "wnbf", date: str = None, 
     if not date:
         raise HTTPException(status_code=400, detail="date parameter required")
     return await _recalc_accrued(portfolio_id, date, force)
+
+
+@app.post("/webhooks/static-changed")
+async def webhook_static_changed(request: Request, background_tasks: BackgroundTasks):
+    """Supabase webhook: fires when local_bond_reference or bond_identity changes.
+
+    Finds every (portfolio_id, date) row in athena_bbg for the affected ISIN and
+    queues recalc_accrued for each — so Athena shows correct numbers immediately
+    after any static data edit (day_count, frequency, coupon, maturity, bdc).
+
+    Setup in Supabase Dashboard → Database → Webhooks:
+      - Table: local_bond_reference  (athena project)  Events: UPDATE
+      - Table: bond_identity         (bond-data project) Events: UPDATE
+      Both pointing at: POST <recon-mcp-url>/webhooks/static-changed
+      Header: X-Webhook-Secret = WEBHOOK_SECRET env var
+    """
+    import os, httpx
+    secret = os.environ.get("WEBHOOK_SECRET")
+    if secret and request.headers.get("X-Webhook-Secret", "") != secret:
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+    body = await request.json()
+    record = body.get("record") or body.get("old_record") or {}
+    isin = record.get("isin")
+    if not isin:
+        return {"status": "ignored", "reason": "no ISIN in payload"}
+
+    table      = body.get("table", "unknown")
+    event_type = body.get("type", "unknown")
+    logger.info("webhook_static_changed: %s on %s isin=%s", event_type, table, isin)
+
+    # Find every (portfolio_id, date) for this ISIN that we have accrued data for
+    from recon_db import SUPABASE_URL, _headers
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/athena_bbg",
+            headers=_headers(),
+            params={"isin": f"eq.{isin}", "select": "portfolio_id,date"},
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"athena_bbg fetch failed: {resp.status_code}")
+
+    combos = {(r["portfolio_id"], r["date"]) for r in resp.json()}
+    if not combos:
+        return {"status": "ok", "isin": isin, "recalculated": 0, "message": "ISIN not in athena_bbg"}
+
+    async def _run_recalcs():
+        results = await asyncio.gather(
+            *[_recalc_accrued(pid, dt, force=True) for pid, dt in combos],
+            return_exceptions=True,
+        )
+        n_ok = sum(1 for r in results if not isinstance(r, Exception))
+        logger.info(
+            "webhook_static_changed: isin=%s recalced %d/%d portfolio-dates",
+            isin, n_ok, len(combos),
+        )
+
+    background_tasks.add_task(_run_recalcs)
+
+    return {
+        "status": "ok",
+        "isin": isin,
+        "table": table,
+        "portfolio_dates_queued": len(combos),
+        "combos": [{"portfolio_id": p, "date": d} for p, d in sorted(combos)],
+    }
 
 
 @app.post("/enrich/from-recon-bbg")
