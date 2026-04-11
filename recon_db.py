@@ -683,6 +683,7 @@ async def store_athena_bbg(portfolio_id: str, date: str, rows: list[dict]) -> in
     new_isins = {r.get("isin") for r in rows if r.get("isin")}
     if new_isins:
         await _delete_stale("athena_bbg", portfolio_id, date, new_isins)
+    now = datetime.utcnow().isoformat() + "Z"
     upsert_rows = [{
         "portfolio_id": portfolio_id,
         "date": date,
@@ -694,6 +695,7 @@ async def store_athena_bbg(portfolio_id: str, date: str, rows: list[dict]) -> in
         "accrued_t1": r.get("accrued_t1"),
         "accrued_c2": r.get("accrued_c2"),
         "accrued_c3": r.get("accrued_c3"),
+        "updated_at": now,
     } for r in rows]
     return await _upsert("athena_bbg", upsert_rows, "portfolio_id,date,isin")
 

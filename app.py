@@ -719,6 +719,7 @@ async def recalc_single_bond(isin: str, date: str, portfolio_id: str = "wnbf"):
                 "accrued_t0": _scale(t0.get("accrued_interest")),
                 "accrued_c1": _scale(c1.get("accrued_interest")),
                 "accrued_t1": None, "accrued_c2": None, "accrued_c3": None,
+                "updated_at": datetime.utcnow().isoformat() + "Z",
             }
             # Upsert just this one bond — don't use store_athena_bbg which deletes stale rows
             upsert_row = {"portfolio_id": portfolio_id, "date": date, **athena_row}
@@ -1127,6 +1128,7 @@ async def recalc_portfolio(portfolio_id: str = "gcrif", date: str = None):
                     "accrued_t1": v("t1", "accrued") * mult if v("t1", "accrued") else None,
                     "accrued_c2": v("c2", "accrued") * mult if v("c2", "accrued") else None,
                     "accrued_c3": v("c3", "accrued") * mult if v("c3", "accrued") else None,
+                    "updated_at": datetime.utcnow().isoformat() + "Z",
                 }], "portfolio_id,date,isin")
 
             # Build result row for the response grid
