@@ -25,7 +25,8 @@ def generate_auth_token() -> str:
     """Generate a session token."""
     import hmac as _hmac
     random_part = secrets.token_hex(8)
-    auth_secret_hash = os.environ.get("AUTH_SECRET_HASH", "")
+    auth_secret = os.environ.get("AUTH_SECRET", "")
+    auth_secret_hash = hashlib.sha256(auth_secret.encode()).hexdigest() if auth_secret else ""
     service_id = os.environ.get("RAILWAY_SERVICE_ID", "local-dev")
 
     if auth_secret_hash:
