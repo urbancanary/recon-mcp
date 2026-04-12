@@ -22,14 +22,19 @@ _cache: dict[str, tuple[str, float]] = {}  # key -> (value, expiry)
 
 
 def generate_auth_token() -> str:
-    """Generate a self-validating token for auth.
-
-    Token format: {random_hex}-{checksum}
-    Checksum: First 8 chars of SHA256(random_hex)
-    """
+    """Generate a session token."""
+    import hmac as _hmac
     random_part = secrets.token_hex(8)
-    checksum = hashlib.sha256(random_part.encode()).hexdigest()[:8]
-    return f"{random_part}-{checksum}"
+    auth_secret_hash = os.environ.get("AUTH_SECRET_HASH", "")
+    service_id = os.environ.get("RAILWAY_SERVICE_ID", "local-dev")
+
+    if auth_secret_hash:
+        payload = f"{random_part}|{service_id}"
+        mac = _hmac.new(auth_secret_hash.encode(), payload.encode(), hashlib.sha256).hexdigest()[:16]
+        return f"{random_part}|{service_id}|{mac}"
+    else:
+        checksum = hashlib.sha256(random_part.encode()).hexdigest()[:8]
+        return f"{random_part}-{checksum}"
 
 
 def _fetch_from_auth(path: str, params: dict = None) -> str:
