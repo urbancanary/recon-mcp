@@ -25,6 +25,7 @@ from recon_engine import (
     process_admin_upload,
     process_maia_upload,
     recalc_accrued as _recalc_accrued,
+    diagnose_accrued_convention,
 )
 from alerts import alert_upload_failed
 
@@ -505,6 +506,23 @@ async def recalc_accrued_endpoint(portfolio_id: str = "wnbf", date: str = None, 
     if not date:
         raise HTTPException(status_code=400, detail="date parameter required")
     return await _recalc_accrued(portfolio_id, date, force)
+
+
+@app.post("/diagnose/accrued")
+async def diagnose_accrued_endpoint(
+    isin: str,
+    accrued: float,
+    date: str,
+    par: float = None,
+):
+    """Reverse-engineer what convention produces the given accrued amount for an ISIN/date.
+
+    Pass any accrued value (from Maia, admin, or any other source) and get back
+    a ranked list of (day_count, frequency, offset) combinations sorted by closeness.
+
+    Example: /diagnose/accrued?isin=HK0000942448&accrued=12345.67&date=2026-04-08
+    """
+    return await diagnose_accrued_convention(isin, accrued, date, par)
 
 
 @app.post("/webhooks/static-changed")

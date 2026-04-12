@@ -14,6 +14,7 @@ import os
 import re
 import asyncio
 import httpx
+from datetime import datetime, timedelta
 
 from recon_db import (
     store_bbg, store_admin, store_maia, store_calcs, store_athena_bbg,
@@ -644,6 +645,285 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
     return 0
 
 
+# ── Accrued helpers (module-level so diagnose + recalc can both use them) ───
+
+# Bloomberg CDR CNH Currency calendar. Update each December.
+_CNY_HOLIDAYS = frozenset([
+    # 2025
+    (2025, 1, 1),
+    (2025, 1, 28), (2025, 1, 29), (2025, 1, 30), (2025, 1, 31),
+    (2025, 2, 1), (2025, 2, 2), (2025, 2, 3), (2025, 2, 4),
+    (2025, 4, 4), (2025, 4, 5),
+    (2025, 5, 1), (2025, 5, 2), (2025, 5, 5),
+    (2025, 5, 31),
+    (2025, 10, 1), (2025, 10, 2), (2025, 10, 3), (2025, 10, 6), (2025, 10, 7),
+    # 2026
+    (2026, 1, 1), (2026, 1, 2),
+    (2026, 2, 16), (2026, 2, 17), (2026, 2, 18), (2026, 2, 19),
+    (2026, 2, 20), (2026, 2, 23),
+    (2026, 4, 3), (2026, 4, 4), (2026, 4, 7),
+    (2026, 5, 1), (2026, 5, 4), (2026, 5, 5),
+    (2026, 5, 25),
+    (2026, 6, 19),
+    (2026, 7, 1),
+    (2026, 9, 25), (2026, 9, 26),
+    (2026, 10, 1), (2026, 10, 2), (2026, 10, 5), (2026, 10, 6), (2026, 10, 7),
+    # 2027
+    (2027, 1, 1),
+    (2027, 2, 5), (2027, 2, 8), (2027, 2, 9),
+    (2027, 2, 10), (2027, 2, 11), (2027, 2, 12),
+    (2027, 3, 26), (2027, 3, 27), (2027, 3, 29),
+    (2027, 4, 5),
+    (2027, 5, 1), (2027, 5, 3), (2027, 5, 4), (2027, 5, 5),
+    (2027, 5, 13),
+    (2027, 6, 9),
+    (2027, 7, 1),
+    (2027, 9, 15), (2027, 9, 16),
+    (2027, 10, 1), (2027, 10, 2),
+    # 2028
+    (2028, 1, 3),
+    (2028, 1, 24), (2028, 1, 25), (2028, 1, 26), (2028, 1, 27),
+    (2028, 1, 28), (2028, 1, 31),
+    (2028, 4, 3), (2028, 4, 4),
+    (2028, 4, 14), (2028, 4, 15), (2028, 4, 17),
+    (2028, 5, 1), (2028, 5, 2), (2028, 5, 3), (2028, 5, 4), (2028, 5, 5),
+    (2028, 5, 29),
+    (2028, 7, 1),
+    (2028, 10, 1), (2028, 10, 2),
+])
+
+
+def _is_non_business(dt, currency):
+    """Weekend-or-CNY-holiday check. CNY calendar only applies to CNY/CNH bonds."""
+    if dt.weekday() >= 5:
+        return True
+    if currency in ('CNY', 'CNH') and (dt.year, dt.month, dt.day) in _CNY_HOLIDAYS:
+        return True
+    return False
+
+
+def _adjust_bdc(dt, bdc, currency=None):
+    """Apply business day convention. Rolls past weekends and CNY holidays."""
+    if not bdc or bdc == 'Unadjusted':
+        return dt
+    if not _is_non_business(dt, currency):
+        return dt
+    following = dt
+    for _ in range(14):
+        following = following + timedelta(days=1)
+        if not _is_non_business(following, currency):
+            break
+    if bdc == 'Following':
+        return following
+    if bdc == 'ModifiedFollowing':
+        if following.month != dt.month:
+            preceding = dt
+            for _ in range(14):
+                preceding = preceding - timedelta(days=1)
+                if not _is_non_business(preceding, currency):
+                    return preceding
+            return dt
+        return following
+    if bdc == 'Preceding':
+        preceding = dt
+        for _ in range(14):
+            preceding = preceding - timedelta(days=1)
+            if not _is_non_business(preceding, currency):
+                return preceding
+        return dt
+    return dt
+
+
+def _last_coupon_before(settle, coup_months, coup_day, bdc='Unadjusted', currency=None):
+    last_coupon = None
+    for y in [settle.year, settle.year - 1]:
+        for m in sorted(coup_months, reverse=True):
+            try:
+                cd = datetime(y, m, coup_day)
+            except ValueError:
+                cd = datetime(y, m, 28)
+            cd = _adjust_bdc(cd, bdc, currency)
+            if cd < settle:
+                if last_coupon is None or cd > last_coupon:
+                    last_coupon = cd
+                break
+    return last_coupon
+
+
+def _accrued_at(settle, coupon, freq, mat, coup_months, coup_day, day_count, par,
+                accrual_start=None, bdc='Unadjusted', currency=None):
+    last_coupon = _last_coupon_before(settle, coup_months, coup_day, bdc, currency)
+    if last_coupon and accrual_start and last_coupon < accrual_start:
+        last_coupon = accrual_start
+    if last_coupon and accrual_start and last_coupon >= accrual_start and (last_coupon - accrual_start).days < 30:
+        last_coupon = accrual_start
+    if not last_coupon:
+        if accrual_start and accrual_start < settle:
+            last_coupon = accrual_start
+        else:
+            return 0.0
+
+    if "30" in day_count:
+        d1 = min(last_coupon.day, 30)
+        d2 = min(settle.day, 30) if d1 == 30 else settle.day
+        days = (settle.year - last_coupon.year) * 360 + (settle.month - last_coupon.month) * 30 + (d2 - d1)
+        per100 = coupon / freq * days / (360 / freq)
+    elif "365" in day_count:
+        # Chinese bond (PBOC/NAFMII): accrue at full annual rate / 365 regardless of payment freq
+        accrual_freq = 1 if freq == 2 else freq
+        per100 = coupon / accrual_freq * (settle - last_coupon).days / 365
+    else:
+        actual = (settle - last_coupon).days
+        nc = None
+        for m in sorted(coup_months):
+            try:
+                nc = datetime(last_coupon.year if m > last_coupon.month else last_coupon.year + 1, m, coup_day)
+            except ValueError:
+                nc = datetime(last_coupon.year if m > last_coupon.month else last_coupon.year + 1, m, 28)
+            if nc > last_coupon:
+                break
+        period = (nc - last_coupon).days if nc else 182
+        per100 = coupon / freq * actual / period
+
+    return round(per100 * par / 100, 6)
+
+
+# ── Convention diagnosis (shared brute-force helper) ────────────────────────
+
+def _brute_force_convention(
+    target_accrued: float,
+    par: float,
+    trade_date,
+    mat,
+    coupon: float,
+    coup_day: int,
+    accrual_start,
+    bdc: str,
+    currency: str,
+) -> list[dict]:
+    """Try all day_count × frequency × offset combinations against target_accrued.
+
+    Returns a list of all combinations sorted by abs diff ascending.
+    Each entry: {day_count, frequency, offset, accrued, diff, diff_per100, last_coupon_date, days_accrued}
+    """
+    results = []
+    day_counts = ["30/360", "ACT/365", "ACT/ACT", "30E/360"]
+    for dc in day_counts:
+        for freq in [1, 2]:
+            coup_months = [mat.month] if freq == 1 else sorted(
+                set([(mat.month - 1) % 12 + 1, ((mat.month + 5) % 12) + 1])
+            )
+            for offset in range(4):
+                settle = trade_date + timedelta(days=offset)
+                acc = _accrued_at(settle, coupon, freq, mat, coup_months, coup_day, dc, par,
+                                  accrual_start=accrual_start, bdc=bdc, currency=currency)
+                lc = _last_coupon_before(trade_date, coup_months, coup_day, bdc, currency)
+                if lc and accrual_start and lc < accrual_start:
+                    lc = accrual_start
+                diff = abs(acc - target_accrued)
+                results.append({
+                    "day_count":        dc,
+                    "frequency":        "Annual" if freq == 1 else "Semiannual",
+                    "offset":           f"C+{offset}" if offset else "T+0",
+                    "accrued":          round(acc, 6),
+                    "diff":             round(diff, 6),
+                    "diff_per100":      round(diff / par * 100, 6) if par else None,
+                    "last_coupon_date": lc.date().isoformat() if lc else None,
+                    "days_accrued":     (trade_date - lc).days if lc else None,
+                })
+    results.sort(key=lambda x: x["diff"])
+    return results
+
+
+async def diagnose_accrued_convention(
+    isin: str,
+    target_accrued: float,
+    date: str,
+    par: float | None = None,
+) -> dict:
+    """Reverse-engineer what convention produces target_accrued for the given ISIN/date.
+
+    Useful for understanding what Maia or admin are calculating — pass their accrued
+    value in and get back a ranked list of (day_count, frequency, offset) matches.
+    """
+    from datetime import datetime
+    from recon_db import SUPABASE_URL, _headers, BOND_DATA_URL, _bond_data_headers
+
+    trade_date = datetime.strptime(date, "%Y-%m-%d")
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        ref_resp, identity_resp = await asyncio.gather(
+            client.get(f"{SUPABASE_URL}/rest/v1/local_bond_reference", headers=_headers(), params={
+                "isin": f"eq.{isin}",
+                "select": "isin,maturity_date,day_count,frequency,accrual_date,currency",
+            }),
+            client.get(f"{BOND_DATA_URL}/rest/v1/bond_identity", headers=_bond_data_headers(), params={
+                "isin": f"eq.{isin}",
+                "select": "isin,coupon,business_day_convention",
+            }),
+        )
+
+    ref_rows = ref_resp.json() if ref_resp.status_code == 200 else []
+    id_rows  = identity_resp.json() if identity_resp.status_code == 200 else []
+
+    if not ref_rows:
+        return {"error": f"No static data found for {isin}"}
+
+    ref = ref_rows[0]
+    if id_rows:
+        if id_rows[0].get("coupon") is not None:
+            ref["coupon"] = float(id_rows[0]["coupon"])
+        ref["bdc"] = id_rows[0].get("business_day_convention") or "Unadjusted"
+    else:
+        ref["bdc"] = "Unadjusted"
+
+    coupon   = float(ref.get("coupon") or 0)
+    maturity = ref.get("maturity_date")
+    if not coupon or not maturity:
+        return {"error": f"Missing coupon or maturity for {isin}"}
+
+    mat       = datetime.strptime(maturity[:10], "%Y-%m-%d")
+    coup_day  = mat.day
+    bdc       = ref.get("bdc") or "Unadjusted"
+    currency  = ref.get("currency")
+    accrual_date_str = ref.get("accrual_date")
+    accrual_start    = datetime.strptime(accrual_date_str[:10], "%Y-%m-%d") if accrual_date_str else None
+
+    # If par not supplied, try to look it up from athena_bbg / recon_admin
+    if par is None:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{SUPABASE_URL}/rest/v1/athena_bbg", headers=_headers(), params={
+                "isin": f"eq.{isin}", "date": f"eq.{date}",
+                "select": "par", "limit": "1",
+            })
+        rows = r.json() if r.status_code == 200 else []
+        if rows and rows[0].get("par"):
+            par = float(rows[0]["par"])
+
+    if not par:
+        return {"error": f"No par available for {isin} on {date} — pass par explicitly"}
+
+    matches = _brute_force_convention(
+        target_accrued, par, trade_date, mat, coupon, coup_day,
+        accrual_start, bdc, currency,
+    )
+
+    return {
+        "isin":            isin,
+        "date":            date,
+        "par":             par,
+        "target_accrued":  target_accrued,
+        "target_per100":   round(target_accrued / par * 100, 6),
+        "coupon":          coupon,
+        "maturity_date":   maturity[:10],
+        "day_count_in_db": ref.get("day_count"),
+        "frequency_in_db": ref.get("frequency"),
+        "bdc":             bdc,
+        "top_matches":     matches[:8],   # top 8 ranked by closeness
+        "all_matches":     matches,
+    }
+
+
 # ── Fast accrued recalc (local, no GA10 dependency) ─────────────────────────
 
 async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> dict:
@@ -655,154 +935,7 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
     Called automatically after every BBG upload (force=True) and also available
     via the /recalc/accrued HTTP endpoint.
     """
-    from datetime import datetime, timedelta
     from recon_db import SUPABASE_URL, _headers, _upsert, BOND_DATA_URL, _bond_data_headers
-
-    # Bloomberg CDR CNH Currency calendar, ported from
-    # json_receiver_project/google_analysis10/google_analysis10.py:_add_china_holidays.
-    # Source: State Council announcements, mirrored by Bloomberg.
-    # Update this list each December when the State Council announces the next year.
-    # Needed because QuantLib's China(IB) calendar also lacks future holidays and
-    # recon-mcp doesn't use QuantLib at all.
-    _CNY_HOLIDAYS = frozenset([
-        # 2025
-        (2025, 1, 1),
-        (2025, 1, 28), (2025, 1, 29), (2025, 1, 30), (2025, 1, 31),
-        (2025, 2, 1), (2025, 2, 2), (2025, 2, 3), (2025, 2, 4),
-        (2025, 4, 4), (2025, 4, 5),
-        (2025, 5, 1), (2025, 5, 2), (2025, 5, 5),
-        (2025, 5, 31),
-        (2025, 10, 1), (2025, 10, 2), (2025, 10, 3), (2025, 10, 6), (2025, 10, 7),
-        # 2026
-        (2026, 1, 1), (2026, 1, 2),
-        (2026, 2, 16), (2026, 2, 17), (2026, 2, 18), (2026, 2, 19),
-        (2026, 2, 20), (2026, 2, 23),
-        (2026, 4, 3), (2026, 4, 4), (2026, 4, 7),
-        (2026, 5, 1), (2026, 5, 4), (2026, 5, 5),
-        (2026, 5, 25),
-        (2026, 6, 19),
-        (2026, 7, 1),
-        (2026, 9, 25), (2026, 9, 26),
-        (2026, 10, 1), (2026, 10, 2), (2026, 10, 5), (2026, 10, 6), (2026, 10, 7),
-        # 2027
-        (2027, 1, 1),
-        (2027, 2, 5), (2027, 2, 8), (2027, 2, 9),
-        (2027, 2, 10), (2027, 2, 11), (2027, 2, 12),
-        (2027, 3, 26), (2027, 3, 27), (2027, 3, 29),
-        (2027, 4, 5),
-        (2027, 5, 1), (2027, 5, 3), (2027, 5, 4), (2027, 5, 5),
-        (2027, 5, 13),
-        (2027, 6, 9),
-        (2027, 7, 1),
-        (2027, 9, 15), (2027, 9, 16),
-        (2027, 10, 1), (2027, 10, 2),
-        # 2028
-        (2028, 1, 3),
-        (2028, 1, 24), (2028, 1, 25), (2028, 1, 26), (2028, 1, 27),
-        (2028, 1, 28), (2028, 1, 31),
-        (2028, 4, 3), (2028, 4, 4),
-        (2028, 4, 14), (2028, 4, 15), (2028, 4, 17),
-        (2028, 5, 1), (2028, 5, 2), (2028, 5, 3), (2028, 5, 4), (2028, 5, 5),
-        (2028, 5, 29),
-        (2028, 7, 1),
-        (2028, 10, 1), (2028, 10, 2),
-    ])
-
-    def _is_non_business(dt, currency):
-        """Weekend-or-CNY-holiday check. CNY calendar only applies to CNY/CNH bonds."""
-        if dt.weekday() >= 5:
-            return True
-        if currency in ('CNY', 'CNH') and (dt.year, dt.month, dt.day) in _CNY_HOLIDAYS:
-            return True
-        return False
-
-    def _adjust_bdc(dt, bdc, currency=None):
-        """Apply business day convention. Rolls past weekends, and past Bloomberg
-        CDR CNH holidays when the bond is in CNY/CNH."""
-        if not bdc or bdc == 'Unadjusted':
-            return dt
-        if not _is_non_business(dt, currency):
-            return dt
-        # Walk forward up to 14 days to find the next business day
-        following = dt
-        for _ in range(14):
-            following = following + timedelta(days=1)
-            if not _is_non_business(following, currency):
-                break
-        if bdc == 'Following':
-            return following
-        if bdc == 'ModifiedFollowing':
-            # Spill into next month → roll backward from dt instead
-            if following.month != dt.month:
-                preceding = dt
-                for _ in range(14):
-                    preceding = preceding - timedelta(days=1)
-                    if not _is_non_business(preceding, currency):
-                        return preceding
-                return dt
-            return following
-        if bdc == 'Preceding':
-            preceding = dt
-            for _ in range(14):
-                preceding = preceding - timedelta(days=1)
-                if not _is_non_business(preceding, currency):
-                    return preceding
-            return dt
-        return dt
-
-    def _last_coupon_before(settle, coup_months, coup_day, bdc='Unadjusted', currency=None):
-        last_coupon = None
-        for y in [settle.year, settle.year - 1]:
-            for m in sorted(coup_months, reverse=True):
-                try:
-                    cd = datetime(y, m, coup_day)
-                except ValueError:
-                    cd = datetime(y, m, 28)
-                cd = _adjust_bdc(cd, bdc, currency)
-                if cd < settle:
-                    if last_coupon is None or cd > last_coupon:
-                        last_coupon = cd
-                    break
-        return last_coupon
-
-    def _accrued_at(settle, coupon, freq, mat, coup_months, coup_day, day_count, par,
-                    accrual_start=None, bdc='Unadjusted', currency=None):
-        last_coupon = _last_coupon_before(settle, coup_months, coup_day, bdc, currency)
-        if last_coupon and accrual_start and last_coupon < accrual_start:
-            last_coupon = accrual_start
-        # Phantom coupon: coup_day arithmetic can land just after issue date — discard it
-        if last_coupon and accrual_start and last_coupon >= accrual_start and (last_coupon - accrual_start).days < 30:
-            last_coupon = accrual_start
-        if not last_coupon:
-            if accrual_start and accrual_start < settle:
-                last_coupon = accrual_start
-            else:
-                return 0.0
-
-        if "30" in day_count:
-            d1 = min(last_coupon.day, 30)
-            d2 = min(settle.day, 30) if d1 == 30 else settle.day
-            days = (settle.year - last_coupon.year) * 360 + (settle.month - last_coupon.month) * 30 + (d2 - d1)
-            per100 = coupon / freq * days / (360 / freq)
-        elif "365" in day_count:
-            # Chinese bond (PBOC/NAFMII) convention: accrue at full annual rate / 365,
-            # regardless of payment frequency (semi-annual bonds do NOT divide coupon by 2).
-            accrual_freq = 1 if freq == 2 else freq
-            per100 = coupon / accrual_freq * (settle - last_coupon).days / 365
-        else:
-            actual = (settle - last_coupon).days
-            nc = None
-            for m in sorted(coup_months):
-                try:
-                    nc = datetime(last_coupon.year if m > last_coupon.month else last_coupon.year + 1, m, coup_day)
-                except ValueError:
-                    nc = datetime(last_coupon.year if m > last_coupon.month else last_coupon.year + 1, m, 28)
-                if nc > last_coupon:
-                    break
-            period = (nc - last_coupon).days if nc else 182
-            per100 = coupon / freq * actual / period
-
-        return round(per100 * par / 100, 6)
 
     async with httpx.AsyncClient(timeout=15) as client:
         bbg_resp, athena_resp, ref_resp, holdings_resp, maia_resp, admin_resp = await asyncio.gather(
@@ -829,7 +962,7 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
             }),
             client.get(f"{SUPABASE_URL}/rest/v1/recon_admin", headers=_headers(), params={
                 "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
-                "select": "isin,par,price",
+                "select": "isin,par,price,accrued",
             }),
         )
 
@@ -1056,6 +1189,22 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
                 isin, bbg_ref, best_diff_per100, conv_hypothesis, conv_diff_per100 or 0,
             )
 
+        # Admin accrued diagnosis — reverse-engineer what convention admin is using
+        admin_hypothesis  = None
+        admin_diff_per100 = None
+        admin_accrued_raw = admin_bonds.get(isin, {}).get("accrued")
+        if admin_accrued_raw is not None:
+            admin_accrued = float(admin_accrued_raw)
+            if admin_accrued != 0 and par:
+                admin_matches = _brute_force_convention(
+                    admin_accrued, par, trade_date, mat, coupon, coup_day,
+                    accrual_start, bdc, currency,
+                )
+                if admin_matches:
+                    best = admin_matches[0]
+                    admin_hypothesis  = f"{best['day_count']} {best['frequency']} {best['offset']}"
+                    admin_diff_per100 = best["diff_per100"]
+
         updated_rows.append({
             "isin": isin, "par": par, "source_price": price,
             "day_count": day_count if "30" not in day_count else "30/360",
@@ -1072,6 +1221,8 @@ async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> d
             "accrued_c3": acc_c3,
             "conv_hypothesis":  conv_hypothesis,
             "conv_diff_per100": conv_diff_per100,
+            "admin_hypothesis":  admin_hypothesis,
+            "admin_diff_per100": admin_diff_per100,
             "static_hash": current_hashes.get(isin),
         })
 
