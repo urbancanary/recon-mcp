@@ -114,6 +114,9 @@ GRANT SELECT ON v_athena_admin_accrued TO anon, authenticated;
 -- Diff in basis points (yield × 100)
 -- ════════════════════════════════════════════════════════════════════
 
+-- recon_calcs needs ga10_ytal for the YTConv column (added 2026-04-28).
+ALTER TABLE recon_calcs ADD COLUMN IF NOT EXISTS ga10_ytal numeric;
+
 DROP VIEW IF EXISTS v_athena_bbg_yield;
 
 CREATE VIEW v_athena_bbg_yield AS
@@ -124,7 +127,7 @@ SELECT
     COALESCE(bi.branded_description, b.description) AS description,
     bi.branded_ticker AS ticker,
     COALESCE(br.currency, 'USD') AS currency,
-    COALESCE(bi.coupon, br.coupon::numeric) AS coupon,
+    bi.coupon,
     COALESCE(bi.maturity_date, br.maturity_date) AS maturity_date,
     c.source_price AS athena_price,
     b.price        AS bbg_price,
@@ -132,11 +135,41 @@ SELECT
     c.ga10_yield_worst   AS athena_ytw,
     c.ga10_yield_c1      AS athena_ytw_c1,
     c.ga10_yield_t1      AS athena_ytw_t1,
+    c.ga10_ytal          AS athena_ytal,
+    -- Convention-aware yield. Apples-to-apples vs BBG's published YTW.
+    --   YTAL when ytal differs from ytm by > 0.5bp (the bond is amortising)
+    --   YTW otherwise (bullet or callable)
+    CASE
+        WHEN c.ga10_ytal IS NOT NULL AND c.ga10_yield IS NOT NULL
+             AND ABS(c.ga10_ytal - c.ga10_yield) > 0.005
+        THEN c.ga10_ytal
+        ELSE c.ga10_yield_worst
+    END AS athena_ytconv,
+    -- Marker so the UI can show which convention was picked per row.
+    CASE
+        WHEN c.ga10_ytal IS NOT NULL AND c.ga10_yield IS NOT NULL
+             AND ABS(c.ga10_ytal - c.ga10_yield) > 0.005
+        THEN 'YTAL'
+        ELSE 'YTW'
+    END AS convention,
     b.yield_to_worst     AS bbg_ytw,
+    -- Legacy diff (athena_ytw vs bbg_ytw) preserved; UI may still surface it.
     CASE WHEN c.ga10_yield_worst IS NOT NULL AND b.yield_to_worst IS NOT NULL
          THEN ROUND(((c.ga10_yield_worst - b.yield_to_worst) * 100)::numeric, 1)
          ELSE NULL
     END AS diff_bps,
+    -- The diff that should drive the recon UI badge: YTConv vs BBG YTW.
+    CASE WHEN b.yield_to_worst IS NOT NULL
+         THEN ROUND(((
+                CASE
+                    WHEN c.ga10_ytal IS NOT NULL AND c.ga10_yield IS NOT NULL
+                         AND ABS(c.ga10_ytal - c.ga10_yield) > 0.005
+                    THEN c.ga10_ytal
+                    ELSE c.ga10_yield_worst
+                END
+              - b.yield_to_worst) * 100)::numeric, 1)
+         ELSE NULL
+    END AS diff_bps_ytconv,
     CASE WHEN c.ga10_yield_worst IS NOT NULL AND b.yield_to_worst IS NOT NULL
          THEN ABS((c.ga10_yield_worst - b.yield_to_worst) * 100)
          ELSE 0

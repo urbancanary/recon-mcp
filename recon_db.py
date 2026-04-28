@@ -718,6 +718,7 @@ async def store_calcs(portfolio_id: str, date: str, calcs: list[dict]) -> int:
         "ga10_yield_c1": c.get("ga10_yield_c1"),
         "ga10_yield_t1": c.get("ga10_yield_t1"),
         "ga10_yield_worst": c.get("ga10_yield_worst"),
+        "ga10_ytal": c.get("ga10_ytal"),
         "ga10_duration": c.get("ga10_duration"),
         "ga10_duration_worst": c.get("ga10_duration_worst"),
         "ga10_spread": c.get("ga10_spread"),
