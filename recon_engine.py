@@ -629,6 +629,8 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
                             "accrued_t1": _scale(b.get("accrued_interest_t1")),
                             "accrued_c2": _scale(b.get("accrued_interest_t2")),
                             "accrued_c3": _scale(b.get("accrued_interest_t3")),
+                            "last_coupon_date": b.get("last_coupon_date"),
+                            "days_accrued": b.get("days_accrued"),
                         })
 
                 if calcs:
@@ -927,332 +929,52 @@ async def diagnose_accrued_convention(
     }
 
 
-# ── Fast accrued recalc (local, no GA10 dependency) ─────────────────────────
+# ── Accrued / yield / duration recalc (delegates to GA10) ───────────────────
 
 async def recalc_accrued(portfolio_id: str, date: str, force: bool = False) -> dict:
-    """Compute accrued interest locally for all bonds in a BBG upload.
+    """Recalc accrued + yield + duration for a (portfolio, date) via GA10.
 
-    Uses local_bond_reference conventions (coupon, freq, day_count, accrual_date)
-    and orca_holdings for par. No GA10 dependency — runs in seconds.
+    Replaces the legacy local Python path (which derived coupon schedules
+    from maturity_date and could not handle stub bonds like ADCOP). GA10
+    reads bond_reference live and uses real QuantLib, so this is the
+    single source of truth.
 
-    Called automatically after every BBG upload (force=True) and also available
-    via the /recalc/accrued HTTP endpoint.
+    `force` is preserved for API compatibility but is always treated as True
+    — there is nothing to "skip" once we delegate to the cloud calc.
     """
-    from recon_db import SUPABASE_URL, _headers, _upsert, BOND_DATA_URL, _bond_data_headers
+    from recon_db import SUPABASE_URL, _headers
 
     async with httpx.AsyncClient(timeout=15) as client:
-        bbg_resp, athena_resp, ref_resp, holdings_resp, maia_resp, admin_resp = await asyncio.gather(
-            client.get(f"{SUPABASE_URL}/rest/v1/recon_bbg", headers=_headers(), params={
-                "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
-                "select": "isin,par,price,accrued,accrued_pct,maturity_date",
-            }),
-            client.get(f"{SUPABASE_URL}/rest/v1/athena_bbg", headers=_headers(), params={
-                "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
-                "select": "isin,par,accrued_c1,source_price,static_hash",
-            }),
-            client.get(f"{SUPABASE_URL}/rest/v1/local_bond_reference", headers=_headers(), params={
-                "select": "isin,currency,maturity_date,day_count,frequency,accrual_date",
-            }),
-            client.get(f"{SUPABASE_URL}/rest/v1/orca_holdings", headers=_headers(), params={
-                "portfolio_id": f"eq.{portfolio_id}", "select": "isin,par_amount",
-            }),
-            # Fall-back sources when recon_bbg is empty for the date (e.g.
-            # triggering a recalc against a maia or admin-only date so the
-            # maia recon view has athena_bbg rows with gap=0).
-            client.get(f"{SUPABASE_URL}/rest/v1/recon_maia", headers=_headers(), params={
-                "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
-                "select": "isin,par,price,maturity_date",
-            }),
-            client.get(f"{SUPABASE_URL}/rest/v1/recon_admin", headers=_headers(), params={
-                "portfolio_id": f"eq.{portfolio_id}", "date": f"eq.{date}",
-                "select": "isin,par,price,accrued",
-            }),
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/recon_bbg",
+            headers=_headers(),
+            params={
+                "portfolio_id": f"eq.{portfolio_id}",
+                "date": f"eq.{date}",
+                "select": "isin,par,price",
+            },
         )
 
-    bbg_bonds    = {r["isin"]: r for r in (bbg_resp.json()      if bbg_resp.status_code      == 200 else [])}
-    athena_map   = {r["isin"]: r for r in (athena_resp.json()   if athena_resp.status_code   == 200 else [])}
-    ref_map      = {r["isin"]: r for r in (ref_resp.json()      if ref_resp.status_code      == 200 else [])}
-    holdings_map = {r["isin"]: float(r["par_amount"]) for r in (holdings_resp.json() if holdings_resp.status_code == 200 else []) if r.get("par_amount")}
-    maia_bonds   = {r["isin"]: r for r in (maia_resp.json()     if maia_resp.status_code     == 200 else [])}
-    admin_bonds  = {r["isin"]: r for r in (admin_resp.json()    if admin_resp.status_code    == 200 else [])}
+    if resp.status_code != 200:
+        logger.warning("recalc_accrued: recon_bbg fetch failed %s/%s status=%s",
+                       portfolio_id, date, resp.status_code)
+        return {"recalculated": 0, "checked": 0, "error": "recon_bbg fetch failed"}
 
-    # If recon_bbg has no rows for this date, fall back to maia then admin as
-    # the position/price source. This lets the same recalc_accrued code path
-    # populate athena_bbg for maia-only dates so the v_athena_maia_accrued
-    # view can join at gap=0 and expose all four T+x offsets.
-    if not bbg_bonds and maia_bonds:
-        logger.info("recalc_accrued: no recon_bbg for %s/%s — falling back to recon_maia (%d bonds)",
-                    portfolio_id, date, len(maia_bonds))
-        bbg_bonds = {
-            isin: {
-                "isin": isin,
-                "par": r.get("par"),
-                "price": r.get("price"),
-                "maturity_date": r.get("maturity_date"),
-                "accrued": None,
-                "accrued_pct": None,
-            }
-            for isin, r in maia_bonds.items() if r.get("par") is not None
-        }
-    elif not bbg_bonds and admin_bonds:
-        logger.info("recalc_accrued: no recon_bbg for %s/%s — falling back to recon_admin (%d bonds)",
-                    portfolio_id, date, len(admin_bonds))
-        bbg_bonds = {
-            isin: {
-                "isin": isin,
-                "par": r.get("par"),
-                "price": r.get("price"),
-                "accrued": None,
-                "accrued_pct": None,
-            }
-            for isin, r in admin_bonds.items() if r.get("par") is not None
-        }
+    rows = resp.json()
+    bbg_prices = {r["isin"]: float(r["price"]) for r in rows if r.get("price") is not None}
+    bbg_par    = {r["isin"]: float(r["par"])   for r in rows if r.get("par")   is not None}
 
-    # Fetch coupon + business_day_convention from bond_identity, filtered to only
-    # the ISINs we care about. Without the filter, PostgREST caps the response at
-    # 1000 rows (bond_identity has ~33k), so most HK/XS bonds get silently dropped
-    # and fall through to "missing reference data" — which is exactly the bug
-    # that caused CNY accrued diffs to persist after the ACT/365 fix was deployed.
-    bbg_isins = list(bbg_bonds.keys())
-    if bbg_isins:
-        async with httpx.AsyncClient(timeout=15) as client:
-            identity_resp = await client.get(
-                f"{BOND_DATA_URL}/rest/v1/bond_identity",
-                headers=_bond_data_headers(),
-                params={
-                    "isin": f"in.({','.join(bbg_isins)})",
-                    "select": "isin,coupon,business_day_convention",
-                },
-            )
-        if identity_resp.status_code == 200:
-            for r in identity_resp.json():
-                # Ensure ref entry exists even if local_bond_reference lacks this ISIN
-                if r["isin"] not in ref_map:
-                    ref_map[r["isin"]] = {"isin": r["isin"]}
-                if r.get("coupon") is not None:
-                    ref_map[r["isin"]]["coupon"] = float(r["coupon"])
-                ref_map[r["isin"]]["bdc"] = r.get("business_day_convention") or "Unadjusted"
+    if not bbg_prices:
+        return {"recalculated": 0, "checked": len(rows),
+                "message": "no recon_bbg rows with price for this portfolio/date"}
 
-    trade_date = datetime.strptime(date, "%Y-%m-%d")
-
-    def _static_hash(ref: dict) -> str:
-        """Short hash of the static inputs that drive accrued calculation.
-        If this differs from the stored value, recalc is forced even if numbers look fine."""
-        parts = "|".join([
-            str(ref.get("day_count") or ""),
-            str(ref.get("frequency") or ""),
-            str(ref.get("coupon") or ""),
-            str(ref.get("maturity_date") or ""),
-            str(ref.get("accrual_date") or ""),
-            str(ref.get("bdc") or "Unadjusted"),
-        ])
-        return hashlib.md5(parts.encode()).hexdigest()[:16]
-
-    # Detect bonds whose static convention data has changed since last recalc
-    current_hashes = {isin: _static_hash(ref_map[isin]) for isin in bbg_bonds if isin in ref_map}
-    hash_changed = {
-        isin for isin, h in current_hashes.items()
-        if athena_map.get(isin, {}).get("static_hash") != h
-    }
-    if hash_changed and not force:
-        logger.info(
-            "recalc_accrued: %d bond(s) have changed static data → forcing recalc: %s",
-            len(hash_changed), sorted(hash_changed),
-        )
-
-    needs_recalc = list(bbg_bonds) if force else list({
-        isin for isin, bbg in bbg_bonds.items()
-        if (athena_map.get(isin, {}).get("accrued_c1") is None
-            or bbg.get("accrued") is None
-            or (bbg["accrued"] != 0
-                and abs((athena_map[isin]["accrued_c1"] - bbg["accrued"]) / bbg["accrued"]) > 0.0001))
-    } | hash_changed)
-
-    if not needs_recalc:
-        return {"recalculated": 0, "message": "All bonds already match BBG"}
-
-    updated_rows, skipped = [], []
-    for isin in needs_recalc:
-        ref    = ref_map.get(isin)
-        bbg    = bbg_bonds[isin]
-        athena = athena_map.get(isin, {})
-
-        if not ref or not ref.get("coupon") or not ref.get("maturity_date"):
-            skipped.append({"isin": isin, "reason": "missing reference data"})
-            continue
-
-        coupon    = float(ref["coupon"])
-        maturity  = bbg.get("maturity_date") or ref["maturity_date"]
-        day_count = ref.get("day_count") or "30/360"
-        par = (holdings_map.get(isin)
-               or (float(bbg["par"]) if bbg.get("par") else None)
-               or (float(athena["par"]) if athena.get("par") else None))
-        if not par:
-            skipped.append({"isin": isin, "reason": "no par amount"}); continue
-
-        price = (float(bbg["price"]) if bbg.get("price")
-                 else (float(athena["source_price"]) if athena.get("source_price") else None))
-        if not price:
-            skipped.append({"isin": isin, "reason": "no price"}); continue
-
-        mat = datetime.strptime(maturity[:10], "%Y-%m-%d")
-        freq_str = (ref.get("frequency") or "").lower()
-        if freq_str in ("annual", "annually", "1"):
-            freq, coup_months = 1, [mat.month]
-        else:
-            freq = 2
-            coup_months = sorted(set([(mat.month - 1) % 12 + 1, ((mat.month + 5) % 12) + 1]))
-        coup_day = mat.day
-
-        accrual_date_str = ref.get("accrual_date")
-        accrual_start = datetime.strptime(accrual_date_str[:10], "%Y-%m-%d") if accrual_date_str else None
-        bdc = ref.get("bdc") or "Unadjusted"
-        currency = ref.get("currency")
-
-        args = (coupon, freq, mat, coup_months, coup_day, day_count, par)
-        lc = _last_coupon_before(trade_date, coup_months, coup_day, bdc, currency)
-        if lc and accrual_start and lc < accrual_start:
-            lc = accrual_start
-        if lc and accrual_start and lc >= accrual_start and (lc - accrual_start).days < 30:
-            lc = accrual_start
-        days_acc = (trade_date - lc).days if lc else None
-
-        acc_t0 = _accrued_at(trade_date,                     *args, accrual_start=accrual_start, bdc=bdc, currency=currency)
-        acc_c1 = _accrued_at(trade_date + timedelta(days=1), *args, accrual_start=accrual_start, bdc=bdc, currency=currency)
-        acc_c2 = _accrued_at(trade_date + timedelta(days=2), *args, accrual_start=accrual_start, bdc=bdc, currency=currency)
-        acc_c3 = _accrued_at(trade_date + timedelta(days=3), *args, accrual_start=accrual_start, bdc=bdc, currency=currency)
-
-        # Business-day-adjusted T+1/T+2/T+3 — step forward skipping weekends
-        # and (for CNY/CNH bonds) the CNY holiday calendar via _is_non_business.
-        # For most USD bonds the weekend roll is what matters; for mainland /
-        # HK CNY bonds we skip Chinese New Year / Golden Week / etc.
-        def _advance_business_days(start, n):
-            cur = start
-            added = 0
-            while added < n:
-                cur = cur + timedelta(days=1)
-                if not _is_non_business(cur, currency):
-                    added += 1
-            return cur
-        t1_date = _advance_business_days(trade_date, 1)
-        t2_date = _advance_business_days(trade_date, 2)
-        t3_date = _advance_business_days(trade_date, 3)
-        acc_t1 = _accrued_at(t1_date, *args, accrual_start=accrual_start, bdc=bdc, currency=currency)
-        acc_t2 = _accrued_at(t2_date, *args, accrual_start=accrual_start, bdc=bdc, currency=currency)
-        acc_t3 = _accrued_at(t3_date, *args, accrual_start=accrual_start, bdc=bdc, currency=currency)
-
-        # BBG reference accrued: prefer par × accrued_pct/100 (matches SQL view), fall back to stored accrued
-        bbg_pct = bbg.get("accrued_pct")
-        bbg_ref = (float(bbg_pct) * par / 100) if bbg_pct is not None else (float(bbg["accrued"]) if bbg.get("accrued") else None)
-
-        # Find which offset is closest to BBG — for diagnostic display
-        offset_candidates = [("T+0", acc_t0), ("C+1", acc_c1), ("C+2", acc_c2), ("C+3", acc_c3)]
-        if bbg_ref and par:
-            best_name, best_acc = min(
-                [(n, v) for n, v in offset_candidates if v is not None],
-                key=lambda x: abs(x[1] - bbg_ref), default=(None, None)
-            )
-            best_diff_per100 = abs(best_acc - bbg_ref) / par * 100 if best_acc is not None else None
-        else:
-            best_name, best_diff_per100 = None, None
-
-        # Convention diagnosis: if best offset is still off by >0.01 per 100 face,
-        # brute-force day_count × frequency × offset to find what would match BBG.
-        conv_hypothesis = None
-        conv_diff_per100 = None
-        if bbg_ref and par and best_diff_per100 is not None and best_diff_per100 > 0.01:
-            day_counts = ["30/360", "ACT/365", "ACT/ACT", "30E/360"]
-            freqs      = [1, 2]
-            best_hyp_diff = float("inf")
-            for dc_try in day_counts:
-                for freq_try in freqs:
-                    # Recompute coup_months for this frequency
-                    if freq_try == 1:
-                        cm_try = [mat.month]
-                    else:
-                        cm_try = sorted(set([(mat.month - 1) % 12 + 1, ((mat.month + 5) % 12) + 1]))
-                    freq_label = "Annual" if freq_try == 1 else "Semi"
-                    args_try = (coupon, freq_try, mat, cm_try, coup_day, dc_try, par)
-                    for offset in range(4):
-                        settle_try = trade_date + timedelta(days=offset)
-                        acc_try = _accrued_at(settle_try, *args_try, accrual_start=accrual_start, bdc=bdc, currency=currency)
-                        diff_try = abs(acc_try - bbg_ref) / par * 100
-                        if diff_try < best_hyp_diff:
-                            best_hyp_diff = diff_try
-                            offset_label = f"C+{offset}" if offset else "T+0"
-                            conv_hypothesis = f"{dc_try} {freq_label} {offset_label}"
-                            conv_diff_per100 = round(diff_try, 6)
-            # If hypothesis matches the current convention, clear it (no new info)
-            curr_dc  = "30/360" if "30" in day_count else day_count
-            curr_lbl = "Annual" if freq == 1 else "Semi"
-            if conv_hypothesis == f"{curr_dc} {curr_lbl} C+1":
-                conv_hypothesis = None
-            logger.debug(
-                "recalc_accrued: %s bbg_ref=%.4f best_c1_diff=%.4f/100 → hypothesis=%s diff=%.4f/100",
-                isin, bbg_ref, best_diff_per100, conv_hypothesis, conv_diff_per100 or 0,
-            )
-
-        # Admin accrued diagnosis — reverse-engineer what convention admin is using
-        admin_hypothesis  = None
-        admin_diff_per100 = None
-        admin_accrued_raw = admin_bonds.get(isin, {}).get("accrued")
-        if admin_accrued_raw is not None:
-            admin_accrued = float(admin_accrued_raw)
-            if admin_accrued != 0 and par:
-                admin_matches = _brute_force_convention(
-                    admin_accrued, par, trade_date, mat, coupon, coup_day,
-                    accrual_start, bdc, currency,
-                )
-                if admin_matches:
-                    best = admin_matches[0]
-                    admin_hypothesis  = f"{best['day_count']} {best['frequency']} {best['offset']}"
-                    admin_diff_per100 = best["diff_per100"]
-
-        updated_rows.append({
-            "isin": isin, "par": par, "source_price": price,
-            "day_count": day_count if "30" not in day_count else "30/360",
-            "last_coupon_date": lc.date().isoformat() if lc else None,
-            "days_accrued": days_acc,
-            "accrued_t0": acc_t0,
-            "accrued_c1": acc_c1,
-            # T+1/T+2/T+3 now business-day-adjusted (skip weekends + CNY holidays)
-            # rather than duplicating calendar offsets.
-            "accrued_t1": acc_t1,
-            "accrued_t2": acc_t2,
-            "accrued_t3": acc_t3,
-            "accrued_c2": acc_c2,
-            "accrued_c3": acc_c3,
-            "conv_hypothesis":  conv_hypothesis,
-            "conv_diff_per100": conv_diff_per100,
-            "admin_hypothesis":  admin_hypothesis,
-            "admin_diff_per100": admin_diff_per100,
-            "static_hash": current_hashes.get(isin),
-        })
-
-    if updated_rows:
-        await _upsert("athena_bbg",
-                      [{"portfolio_id": portfolio_id, "date": date, **r} for r in updated_rows],
-                      "portfolio_id,date,isin")
-
-    n_hypothesis = sum(1 for r in updated_rows if r.get("conv_hypothesis"))
-    logger.info(
-        "recalc_accrued: %s/%s → %d updated, %d skipped, %d with convention hypothesis",
-        portfolio_id, date, len(updated_rows), len(skipped), n_hypothesis,
-    )
+    n = await recalc_with_bbg_prices(bbg_prices, date, portfolio_id, bbg_par)
+    logger.info("recalc_accrued (GA10): %s/%s → %d calcs (of %d positions)",
+                portfolio_id, date, n, len(rows))
     return {
-        "recalculated": len(updated_rows),
-        "checked": len(needs_recalc),
-        "skipped": skipped,
-        "convention_hypotheses": n_hypothesis,
-        "bonds": [
-            {
-                "isin": r["isin"],
-                "accrued_c1": r["accrued_c1"],
-                **({"conv_hypothesis": r["conv_hypothesis"], "conv_diff_per100": r["conv_diff_per100"]}
-                   if r.get("conv_hypothesis") else {}),
-            }
-            for r in updated_rows
-        ],
+        "recalculated": n,
+        "checked": len(rows),
+        "delegated_to": "GA10 via recalc_with_bbg_prices",
     }
 
 
@@ -1349,11 +1071,8 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
         ),
     )
 
-    # Trigger GA10 recalc (fire-and-forget — can take minutes)
-    asyncio.create_task(recalc_with_bbg_prices(price_bonds, bbg_date, pid, position_bonds))
-
     # Enrich local bond tables with BBG-parsed maturity/coupon for NULL fields.
-    # Awaited so that local_bond_reference is up-to-date before the recalc fires.
+    # Awaited so the GA10 recalc that follows sees fresh static.
     await enrich_bond_data_from_bbg(
         maturity_date_bonds,
         coupon_bonds,
@@ -1363,8 +1082,9 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
         first_coupon_bonds=first_coupon_bonds,
     )
 
-    # Fast accrued recalc — runs immediately after enrich so local_bond_reference is fresh
-    asyncio.create_task(recalc_accrued(pid, bbg_date, force=True))
+    # GA10 is the single source of truth for accrued / yield / duration / value.
+    # Fire-and-forget — populates recon_calcs and athena_bbg in one pass.
+    asyncio.create_task(recalc_with_bbg_prices(price_bonds, bbg_date, pid, position_bonds))
 
     # Sync bond data + Orca holdings for uploaded ISINs (fire-and-forget)
     asyncio.create_task(sync_bond_data(all_isins))

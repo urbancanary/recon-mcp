@@ -1137,7 +1137,7 @@ async def recalc_portfolio(portfolio_id: str = "gcrif", date: str = None):
             }
             await store_calcs(portfolio_id, date, [calc])
 
-            # Update athena_bbg with par-scaled accrued
+            # Update athena_bbg with par-scaled accrued + GA10 metadata
             if par:
                 mult = par / 100
                 await _upsert("athena_bbg", [{
@@ -1148,6 +1148,8 @@ async def recalc_portfolio(portfolio_id: str = "gcrif", date: str = None):
                     "accrued_t1": v("t1", "accrued") * mult if v("t1", "accrued") else None,
                     "accrued_c2": v("c2", "accrued") * mult if v("c2", "accrued") else None,
                     "accrued_c3": v("c3", "accrued") * mult if v("c3", "accrued") else None,
+                    "last_coupon_date": v("c1", "last_coupon_date"),
+                    "days_accrued": v("c1", "days_accrued"),
                     "updated_at": datetime.utcnow().isoformat() + "Z",
                 }], "portfolio_id,date,isin")
 
