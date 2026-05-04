@@ -735,6 +735,10 @@ def _adjust_bdc(dt, bdc, currency=None):
 
 
 def _last_coupon_before(settle, coup_months, coup_day, bdc='Unadjusted', currency=None):
+    # Accrual resets on the CALENDAR coupon date, not the payment date.
+    # bdc/currency are kept in the signature for caller compatibility but
+    # deliberately not applied here — rolling Sun→Mon would shorten accrued
+    # by a day vs admin/BBG (e.g. SAUDI 4.5 Oct-26 falling on Sunday).
     last_coupon = None
     for y in [settle.year, settle.year - 1]:
         for m in sorted(coup_months, reverse=True):
@@ -742,7 +746,6 @@ def _last_coupon_before(settle, coup_months, coup_day, bdc='Unadjusted', currenc
                 cd = datetime(y, m, coup_day)
             except ValueError:
                 cd = datetime(y, m, 28)
-            cd = _adjust_bdc(cd, bdc, currency)
             if cd < settle:
                 if last_coupon is None or cd > last_coupon:
                     last_coupon = cd
