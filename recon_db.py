@@ -210,14 +210,26 @@ async def sync_bond_data(isins: list[str] = None) -> dict:
         )
 
     # Upsert each into local tables in Athena Supabase
+    identity_by_isin: dict[str, dict] = {}
     if not isinstance(id_resp, Exception) and id_resp.status_code == 200:
         rows = id_resp.json()
         if rows:
+            identity_by_isin = {r["isin"]: r for r in rows if r.get("isin")}
             counts["local_bond_identity"] = await _upsert("local_bond_identity", rows, "isin")
 
     if not isinstance(ref_resp, Exception) and ref_resp.status_code == 200:
         rows = ref_resp.json()
         if rows:
+            # Stamp current_static_hash so v_stale_calcs can detect drift on
+            # any recon_calcs row whose calc_static_hash no longer matches.
+            try:
+                from calc_hashes import compute_static_hash
+                for r in rows:
+                    r["current_static_hash"] = compute_static_hash(
+                        r, identity_by_isin.get(r.get("isin"))
+                    )
+            except Exception as e:
+                logger.warning(f"static hash compute failed (continuing): {e!r}")
             counts["local_bond_reference"] = await _upsert("local_bond_reference", rows, "isin")
 
     if not isinstance(ana_resp, Exception) and ana_resp.status_code == 200:
@@ -703,7 +715,12 @@ async def store_athena_bbg(portfolio_id: str, date: str, rows: list[dict]) -> in
 
 
 async def store_calcs(portfolio_id: str, date: str, calcs: list[dict]) -> int:
-    """Store GA10 calculation results. Upserts by (portfolio_id, date, isin)."""
+    """Store GA10 calculation results. Upserts by (portfolio_id, date, isin).
+
+    Provenance columns (calc_static_hash, calc_price_hash, calc_engine_pricing_id,
+    calc_engine_gateway_id, calculated_at) are populated when the caller
+    supplies them; they drive v_stale_calcs in sql/005_calc_staleness_hashes.sql.
+    """
     rows = [{
         "portfolio_id": portfolio_id,
         "date": date,
@@ -727,6 +744,11 @@ async def store_calcs(portfolio_id: str, date: str, calcs: list[dict]) -> int:
         "convention_used": c.get("convention_used"),
         "last_coupon_date": c.get("last_coupon_date"),
         "issue_date": c.get("issue_date"),
+        "calc_static_hash": c.get("calc_static_hash"),
+        "calc_price_hash": c.get("calc_price_hash"),
+        "calc_engine_pricing_id": c.get("calc_engine_pricing_id"),
+        "calc_engine_gateway_id": c.get("calc_engine_gateway_id"),
+        "calculated_at": c.get("calculated_at"),
     } for c in calcs]
     return await _upsert("recon_calcs", rows, "portfolio_id,date,isin")
 
@@ -806,13 +828,70 @@ async def _fetch_independent_athena_prices(isins: list[str], recon_date: str) ->
     return found
 
 
+async def _fetch_calc_static_hashes(portfolio_id: str, date: str, isins: list[str]) -> dict[str, str]:
+    """Read calc_static_hash from recon_calcs for the given (portfolio, date, isin) tuples.
+
+    Used by get_recon_data to compute per-row static_drift. Returns
+    {isin: hash}; missing rows are omitted (drift then reads False).
+    """
+    if not isins:
+        return {}
+    try:
+        isin_filter = ",".join(isins)
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/recon_calcs",
+                headers=_headers(),
+                params={
+                    "portfolio_id": f"eq.{portfolio_id}",
+                    "date": f"eq.{date}",
+                    "isin": f"in.({isin_filter})",
+                    "select": "isin,calc_static_hash",
+                },
+            )
+        if resp.status_code != 200:
+            return {}
+        return {r["isin"]: r["calc_static_hash"]
+                for r in resp.json()
+                if r.get("isin") and r.get("calc_static_hash")}
+    except Exception:
+        return {}
+
+
+async def _fetch_current_static_hashes_db(isins: list[str]) -> dict[str, str]:
+    """Read current_static_hash from local_bond_reference. Sibling of the
+    helper in recon_engine.py — duplicated here to avoid circular import."""
+    if not isins:
+        return {}
+    try:
+        isin_filter = ",".join(isins)
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/local_bond_reference",
+                headers=_headers(),
+                params={
+                    "isin": f"in.({isin_filter})",
+                    "select": "isin,current_static_hash",
+                },
+            )
+        if resp.status_code != 200:
+            return {}
+        return {r["isin"]: r["current_static_hash"]
+                for r in resp.json()
+                if r.get("isin") and r.get("current_static_hash")}
+    except Exception:
+        return {}
+
+
 async def get_recon_data(portfolio_id: str, date: str) -> dict:
     """Fetch recon data for a portfolio/date from the recon_view.
 
     1. Query recon_view (joins all 4 source tables, computes derived fields)
     2. Fetch independent Athena prices from ga10-pricing (date-locked ≤ recon_date)
     3. Override athena_price with the most recent non-BBG price on or before recon_date
-    4. Return display-ready rows
+    4. Attach static_drift per bond from recon_calcs ↔ local_bond_reference
+       (drives the YTW drift chip in athena-html-v3 yield-recon-widget)
+    5. Return display-ready rows
     """
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
@@ -826,6 +905,29 @@ async def get_recon_data(portfolio_id: str, date: str) -> dict:
             },
         )
         rows = resp.json() if resp.status_code == 200 else []
+
+    # Drift flags: compare each row's calc_static_hash to current_static_hash
+    # on local_bond_reference. Engine drift columns deliberately omitted
+    # (Worker bypass — see recalc_with_bbg_prices). Failures here just leave
+    # the flag as False; the chip stays hidden, no breakage.
+    if rows:
+        try:
+            isins = [r["isin"] for r in rows if r.get("isin")]
+            calc_hashes, current_hashes = await asyncio.gather(
+                _fetch_calc_static_hashes(portfolio_id, date, isins),
+                _fetch_current_static_hashes_db(isins),
+            )
+            for row in rows:
+                isin = row.get("isin")
+                if not isin:
+                    continue
+                ch = calc_hashes.get(isin)
+                cur = current_hashes.get(isin)
+                row["static_drift"] = bool(ch and cur and ch != cur)
+                row["engine_pricing_drift"] = False
+                row["engine_gateway_drift"] = False
+        except Exception as e:
+            logger.warning(f"drift flag attachment failed (continuing): {e!r}")
 
     # Date-locked independent Athena prices from ga10-pricing
     if rows:

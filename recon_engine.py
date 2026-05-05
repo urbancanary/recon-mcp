@@ -14,7 +14,7 @@ import os
 import re
 import asyncio
 import httpx
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from recon_db import (
     store_bbg, store_admin, store_maia, store_calcs, store_athena_bbg,
@@ -485,166 +485,192 @@ async def recalc_all_existing() -> dict:
     return {"recalced": len(results), "details": results}
 
 
+async def _fetch_current_static_hashes(isins: list[str]) -> dict[str, str]:
+    """Read current_static_hash from local_bond_reference for the given ISINs.
+
+    Returns {isin: hash} (missing rows omitted). Used by recalc_with_bbg_prices
+    to stamp provenance onto recon_calcs. Failures yield an empty dict —
+    consumer treats missing as drift (None) which is the safe default.
+    """
+    if not isins:
+        return {}
+    try:
+        isin_filter = ",".join(isins)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/local_bond_reference",
+                headers=_headers(),
+                params={
+                    "isin": f"in.({isin_filter})",
+                    "select": "isin,current_static_hash",
+                },
+            )
+        if resp.status_code != 200:
+            logger.warning("static_hash fetch -> %s: %s", resp.status_code, resp.text[:200])
+            return {}
+        return {r["isin"]: r["current_static_hash"]
+                for r in resp.json()
+                if r.get("isin") and r.get("current_static_hash")}
+    except Exception as e:
+        logger.warning("static_hash fetch failed: %r", e)
+        return {}
+
+
 async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
                                   portfolio_id: str, bbg_par: dict = None) -> int:
-    """Store BBG prices in GA10, trigger recalc, fetch results, store in recon_calcs.
+    """Calculate analytics for BBG prices via GA10 GAE /api/v1/portfolio/analysis.
 
-    Retries missing bonds up to 3 times with increasing delay.
-    Alerts on partial failure after final retry.
+    Two parallel batched calls, one per settle date (T+0 and C+1 = price_date + 1
+    calendar day). Each call returns full analytics for every bond in the batch.
+    No Cloudflare Workers, no fan-out, no retry loop — a single round-trip per
+    settle date direct to GAE.
+
+    Stamps each recon_calcs row with provenance hashes (static + price). Engine
+    IDs default to None now that we bypass the Worker layer.
 
     Returns the number of calcs stored.
     """
+    from auth_client import get_api_key
+    from calc_hashes import compute_price_hash
+
     isins = list(bbg_prices.keys())
     if not isins:
         return 0
 
-    isin_set = set(isins)
+    api_key = get_api_key("GA10_API_KEY", requester="recon-mcp")
+    if not api_key:
+        logger.error("GA10_API_KEY missing — cannot calc")
+        return 0
 
+    static_hash_by_isin: dict[str, str] = {}
     try:
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            # 1. Store BBG prices in GA10
-            prices_payload = [
-                {"isin": isin, "source": "BBG", "price_date": price_date, "clean_price": px}
+        static_hash_by_isin = await _fetch_current_static_hashes(isins)
+    except Exception as e:
+        logger.warning("static hash fetch failed (continuing without): %r", e)
+
+    pd_dt = datetime.strptime(price_date, "%Y-%m-%d")
+    settle_t0 = price_date
+    settle_c1 = (pd_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    GAE_URL = "https://future-footing-414610.uc.r.appspot.com"
+
+    def _payload(settle_iso: str) -> dict:
+        inv_date = settle_iso.replace("-", "/")
+        return {
+            "data": [
+                {
+                    "BOND_CD": isin,
+                    "CLOSING PRICE": float(px),
+                    "WEIGHTING": 1.0,
+                    "Inventory Date": inv_date,
+                }
                 for isin, px in bbg_prices.items()
             ]
-            resp = await client.post(
-                f"{GA10_PRICING_URL}/prices/store",
-                json={"prices": prices_payload},
+        }
+
+    async def _call(settle_iso: str) -> dict:
+        async with httpx.AsyncClient(timeout=120.0) as c:
+            r = await c.post(
+                f"{GAE_URL}/api/v1/portfolio/analysis",
+                json=_payload(settle_iso),
+                headers={"Content-Type": "application/json", "X-API-Key": api_key},
             )
-            logger.info("BBG prices stored: %s", resp.status_code)
-
-            # 2. Calculate + retry loop
-            max_retries = 3
-            delays = [15, 30, 60]  # seconds between retries
-            remaining_isins = list(isins)
-
-            for attempt in range(max_retries + 1):
-                if not remaining_isins:
-                    break
-
-                # Trigger calculation for remaining ISINs
-                resp = await client.post(
-                    f"{GA10_PRICING_URL}/prices/calculate",
-                    json={"isins": remaining_isins, "price_date": price_date, "source": "BBG"},
+            if r.status_code != 200:
+                logger.error(
+                    f"GA10 portfolio/analysis settle={settle_iso}: HTTP {r.status_code} {r.text[:200]}"
                 )
-                calc_result = resp.json() if resp.status_code == 200 else {}
-                calculated = calc_result.get("calculated", 0)
+                return {}
+            return r.json()
 
-                # Wait for async processing if needed
-                if calculated == 0:
-                    await asyncio.sleep(10)
-
-                # Fetch results and check which ISINs came back with data
-                resp = await client.get(
-                    f"{GA10_PRICING_URL}/prices/by-date?date={price_date}&source=BBG"
-                )
-                if resp.status_code != 200:
-                    logger.warning(f"GA10 fetch failed on attempt {attempt + 1}: {resp.status_code}")
-                    if attempt < max_retries:
-                        await asyncio.sleep(delays[min(attempt, len(delays) - 1)])
-                    continue
-
-                ga10_bonds = resp.json().get("bonds", [])
-
-                # Check which of OUR ISINs have non-null accrued (= successful calc)
-                returned_isins = set()
-                for b in ga10_bonds:
-                    isin = b.get("isin")
-                    if isin in isin_set and b.get("accrued_interest") is not None:
-                        returned_isins.add(isin)
-
-                remaining_isins = [i for i in isins if i not in returned_isins]
-
-                if attempt == 0:
-                    logger.info(f"GA10 initial: {len(returned_isins)}/{len(isins)} bonds returned")
-                else:
-                    logger.info(f"GA10 retry {attempt}: {len(returned_isins)}/{len(isins)} bonds ({len(remaining_isins)} still missing)")
-
-                if not remaining_isins:
-                    break
-
-                if attempt < max_retries:
-                    delay = delays[min(attempt, len(delays) - 1)]
-                    logger.info(f"GA10: {len(remaining_isins)} missing, retrying in {delay}s: {remaining_isins[:5]}")
-                    await asyncio.sleep(delay)
-
-            # Alert if bonds still missing after all retries
-            if remaining_isins:
-                logger.error(f"GA10 PARTIAL FAILURE: {len(remaining_isins)}/{len(isins)} bonds missing after {max_retries} retries: {remaining_isins}")
-                asyncio.create_task(alert_ga10_partial_failure(
-                    portfolio_id, price_date, len(isins), len(isins) - len(remaining_isins), remaining_isins
-                ))
-
-            # 3. Fetch final results and store
-            resp = await client.get(
-                f"{GA10_PRICING_URL}/prices/by-date?date={price_date}&source=BBG"
-            )
-            if resp.status_code == 200:
-                ga10_bonds = resp.json().get("bonds", [])
-                calcs = []
-                athena_bbg_rows = []
-                par_lookup = bbg_par or {}
-                for b in ga10_bonds:
-                    isin = b.get("isin")
-                    if isin not in isin_set:
-                        continue
-                    # Skip bonds with no accrued at all (T+0 or C+1)
-                    if b.get("accrued_interest") is None and b.get("accrued_interest_c1") is None:
-                        continue
-                    par = par_lookup.get(isin) or 0
-
-                    calcs.append({
-                        "isin": isin,
-                        "source_price": bbg_prices.get(isin),
-                        "ga10_accrued": b.get("accrued_interest"),
-                        "ga10_accrued_c1": b.get("accrued_interest_c1"),
-                        "ga10_accrued_t1": b.get("accrued_interest_t1"),
-                        "ga10_accrued_t2": b.get("accrued_interest_t2"),
-                        "ga10_accrued_t3": b.get("accrued_interest_t3"),
-                        # Use T+0 fields; C+1 can be garbage on weekends
-                        "ga10_yield": b.get("yield_to_maturity"),
-                        "ga10_yield_c1": b.get("ytm_c1"),
-                        "ga10_yield_t1": b.get("ytm_t1"),
-                        "ga10_yield_worst": b.get("ytw_bbg") or b.get("yield_to_maturity"),
-                        "ga10_duration": b.get("modified_duration"),
-                        "ga10_duration_worst": b.get("duration_worst"),
-                        "ga10_spread": b.get("spread"),
-                        "ga10_convexity": b.get("convexity"),
-                        "ga10_dv01": b.get("dv01"),
-                        "convention_used": b.get("day_count"),
-                        "last_coupon_date": b.get("last_coupon_date"),
-                        "issue_date": b.get("issue_date"),
-                    })
-
-                    if par:
-                        mult = par / 100
-                        def _scale(v, m=mult):
-                            return v * m if v is not None else None
-                        athena_bbg_rows.append({
-                            "isin": isin,
-                            "par": par,
-                            "source_price": bbg_prices.get(isin),
-                            "accrued_t0": _scale(b.get("accrued_interest")),
-                            "accrued_c1": _scale(b.get("accrued_interest_c1")),
-                            "accrued_t1": _scale(b.get("accrued_interest_t1")),
-                            "accrued_c2": _scale(b.get("accrued_interest_t2")),
-                            "accrued_c3": _scale(b.get("accrued_interest_t3")),
-                            "last_coupon_date": b.get("last_coupon_date"),
-                            "days_accrued": b.get("days_accrued"),
-                        })
-
-                if calcs:
-                    await store_calcs(portfolio_id, price_date, calcs)
-                if athena_bbg_rows:
-                    await store_athena_bbg(portfolio_id, price_date, athena_bbg_rows)
-
-                logger.info(f"GA10 recalc complete: {len(calcs)} calcs, {len(athena_bbg_rows)} athena_bbg for {portfolio_id}/{price_date}")
-                return len(calcs)
-
+    try:
+        t0_resp, c1_resp = await asyncio.gather(_call(settle_t0), _call(settle_c1))
     except Exception as e:
-        logger.error("BBG price recalc failed: %r", e)
+        logger.error("GA10 portfolio/analysis call failed: %r", e)
+        return 0
 
-    return 0
+    t0_bonds = {b.get("isin"): b for b in (t0_resp.get("bond_data") or []) if b.get("isin")}
+    c1_bonds = {b.get("isin"): b for b in (c1_resp.get("bond_data") or []) if b.get("isin")}
+
+    isin_set = set(isins)
+    returned = isin_set & set(t0_bonds.keys()) & set(c1_bonds.keys())
+    missing = sorted(isin_set - returned)
+
+    if missing:
+        logger.warning(
+            f"GA10 portfolio: {len(missing)}/{len(isin_set)} bonds missing in response: {missing[:5]}"
+        )
+        if len(missing) > len(isin_set) // 4:
+            asyncio.create_task(alert_ga10_partial_failure(
+                portfolio_id, price_date, len(isin_set), len(returned), missing
+            ))
+
+    par_lookup = bbg_par or {}
+    calcs = []
+    athena_bbg_rows = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for isin in returned:
+        t0 = t0_bonds[isin]
+        c1 = c1_bonds[isin]
+        par = par_lookup.get(isin) or 0
+
+        calcs.append({
+            "isin": isin,
+            "source_price": bbg_prices.get(isin),
+            "ga10_accrued":     t0.get("accrued_interest"),
+            "ga10_accrued_c1":  c1.get("accrued_interest"),
+            "ga10_accrued_t1":  None,
+            "ga10_accrued_t2":  None,
+            "ga10_accrued_t3":  None,
+            "ga10_yield":       t0.get("yield"),
+            "ga10_yield_c1":    c1.get("yield"),
+            "ga10_yield_t1":    None,
+            "ga10_yield_worst": t0.get("yield"),
+            "ga10_duration":    t0.get("duration"),
+            "ga10_duration_worst": t0.get("duration"),
+            "ga10_spread":      t0.get("spread"),
+            "ga10_convexity":   None,
+            "ga10_dv01":        None,
+            "convention_used":  t0.get("day_count"),
+            "last_coupon_date": None,
+            "issue_date":       None,
+            # Provenance — drives v_stale_calcs / drift chip
+            "calc_static_hash": static_hash_by_isin.get(isin),
+            "calc_price_hash":  compute_price_hash(
+                bbg_prices.get(isin), price_date, "recon_bbg"
+            ),
+            "calc_engine_pricing_id": None,
+            "calc_engine_gateway_id": None,
+            "calculated_at": now_iso,
+        })
+
+        if par:
+            mult = par / 100
+            def _scale(v, m=mult):
+                return v * m if v is not None else None
+            athena_bbg_rows.append({
+                "isin": isin,
+                "par": par,
+                "source_price": bbg_prices.get(isin),
+                "accrued_t0": _scale(t0.get("accrued_interest")),
+                "accrued_c1": _scale(c1.get("accrued_interest")),
+                "accrued_t1": None,
+                "accrued_c2": None,
+                "accrued_c3": None,
+                "last_coupon_date": None,
+                "days_accrued": None,
+            })
+
+    if calcs:
+        await store_calcs(portfolio_id, price_date, calcs)
+    if athena_bbg_rows:
+        await store_athena_bbg(portfolio_id, price_date, athena_bbg_rows)
+
+    logger.info(
+        f"GA10 portfolio/analysis: {len(calcs)} calcs, {len(athena_bbg_rows)} athena_bbg "
+        f"for {portfolio_id}/{price_date} (settle T+0={settle_t0}, C+1={settle_c1})"
+    )
+    return len(calcs)
 
 
 # ── Accrued helpers (module-level so diagnose + recalc can both use them) ───

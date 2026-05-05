@@ -760,6 +760,110 @@ async def recalc_single_bond(isin: str, date: str, portfolio_id: str = "wnbf"):
         }
 
 
+@app.post("/recalc/stale")
+async def recalc_stale(limit: int = 200):
+    """Safety-net cron: recalc rows whose provenance no longer matches.
+
+    Reads v_stale_calcs (sql/005) for static_drift, plus a separate query
+    against recon_calcs for engine_drift (using the engine ids returned by
+    GA10 /engine/version, since the view's engine columns require GUC vars
+    not easily set per-request via PostgREST).
+
+    Groups stale rows by (portfolio_id, date) and calls the existing
+    recalc_with_bbg_prices for each group, which stamps fresh provenance —
+    so the same row should not appear stale on the next pass.
+
+    Wire to a Railway cron (or any external scheduler) at e.g. */15 * * * *.
+    Idempotent: safe to fire concurrently or repeatedly.
+    """
+    import httpx
+    from recon_db import SUPABASE_URL, _headers
+    from recon_engine import recalc_with_bbg_prices
+    from calc_hashes import fetch_engine_version, engine_ids_from
+
+    engine_pricing_id, engine_gateway_id = engine_ids_from(await fetch_engine_version())
+
+    stale: dict[tuple[str, str], set[str]] = {}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        # Static drift via v_stale_calcs (engine columns inert without GUC)
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/v_stale_calcs",
+            headers=_headers(),
+            params={
+                "select": "portfolio_id,date,isin",
+                "static_drift": "is.true",
+                "limit": str(limit),
+            },
+        )
+        if resp.status_code == 200:
+            for r in resp.json():
+                stale.setdefault((r["portfolio_id"], r["date"]), set()).add(r["isin"])
+
+        # Engine drift detected client-side against fetched current ids
+        if engine_pricing_id:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/recon_calcs",
+                headers=_headers(),
+                params={
+                    "select": "portfolio_id,date,isin",
+                    "calc_engine_pricing_id": f"neq.{engine_pricing_id}",
+                    "limit": str(limit),
+                },
+            )
+            if resp.status_code == 200:
+                for r in resp.json():
+                    stale.setdefault((r["portfolio_id"], r["date"]), set()).add(r["isin"])
+
+    if not stale:
+        return {"checked": 0, "fired_groups": 0, "fired_isins": 0}
+
+    fired_isins = 0
+    fired_groups = 0
+    failures: list[str] = []
+
+    for (portfolio_id, date), isins_set in stale.items():
+        isins = list(isins_set)
+        # Pull BBG price + par for this group, then call recalc_with_bbg_prices
+        # which already stamps provenance from step 2.
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/recon_bbg",
+                headers=_headers(),
+                params={
+                    "portfolio_id": f"eq.{portfolio_id}",
+                    "date": f"eq.{date}",
+                    "isin": f"in.({','.join(isins)})",
+                    "select": "isin,price,par",
+                },
+            )
+            if resp.status_code != 200:
+                failures.append(f"{portfolio_id}/{date}: bbg fetch {resp.status_code}")
+                continue
+            bbg_rows = resp.json()
+
+        bbg_prices = {r["isin"]: float(r["price"]) for r in bbg_rows if r.get("price") is not None}
+        bbg_par    = {r["isin"]: float(r["par"])   for r in bbg_rows if r.get("par")   is not None}
+
+        if not bbg_prices:
+            failures.append(f"{portfolio_id}/{date}: no BBG prices for stale ISINs")
+            continue
+
+        try:
+            count = await recalc_with_bbg_prices(bbg_prices, date, portfolio_id, bbg_par)
+            fired_isins += count
+            fired_groups += 1
+        except Exception as e:
+            failures.append(f"{portfolio_id}/{date}: {e!r}")
+
+    return {
+        "checked": sum(len(v) for v in stale.values()),
+        "fired_groups": fired_groups,
+        "fired_isins": fired_isins,
+        "engine_pricing_id": engine_pricing_id,
+        "engine_gateway_id": engine_gateway_id,
+        "failures": failures,
+    }
 
 
 @app.get("/recon/athena-v-ga10")
