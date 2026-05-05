@@ -501,7 +501,11 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
     isin_set = set(isins)
 
     try:
-        async with httpx.AsyncClient(timeout=180.0) as client:
+        # timeout 600s + 30 concurrent conns: per-bond /prices/accrued-live
+        # fan-out can take 60-90s in parallel; default 10-conn pool would
+        # serialise 26 calls and blow the 180s client cap.
+        limits = httpx.Limits(max_connections=30, max_keepalive_connections=30)
+        async with httpx.AsyncClient(timeout=600.0, limits=limits) as client:
             # 1. Store BBG prices in GA10
             prices_payload = [
                 {"isin": isin, "source": "BBG", "price_date": price_date, "clean_price": px}
@@ -597,25 +601,31 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
                     logger.info(f"GA10 by-date c1=null on {len(needs_c1)}/{len(ga10_by_isin)} bonds — fanning out to accrued-live")
 
                     async def _live_c1(isin: str, settle: str):
+                        t_start = asyncio.get_event_loop().time()
                         try:
                             r = await client.post(
                                 f"{GA10_PRICING_URL}/prices/accrued-live",
                                 json={"isins": [isin], "settlement_date": settle},
                                 timeout=120.0,
                             )
+                            dt = asyncio.get_event_loop().time() - t_start
                             if r.status_code != 200:
+                                logger.warning(f"accrued-live {isin}: HTTP {r.status_code} in {dt:.1f}s")
                                 return isin, None
                             bonds_resp = (r.json() or {}).get("bonds") or []
                             return isin, (bonds_resp[0] if bonds_resp else None)
                         except Exception as e:
-                            logger.warning(f"accrued-live {isin}: {e!r}")
+                            dt = asyncio.get_event_loop().time() - t_start
+                            logger.warning(f"accrued-live {isin}: {e!r} after {dt:.1f}s")
                             return isin, None
 
+                    fan_t0 = asyncio.get_event_loop().time()
                     fan_out = await asyncio.gather(*[_live_c1(i, s) for i, s in needs_c1])
                     for isin, b_live in fan_out:
                         if b_live and b_live.get("accrued_interest") is not None:
                             c1_override[isin] = b_live
-                    logger.info(f"accrued-live fan-out: {len(c1_override)}/{len(needs_c1)} bonds returned C+1")
+                    fan_dt = asyncio.get_event_loop().time() - fan_t0
+                    logger.info(f"accrued-live fan-out: {len(c1_override)}/{len(needs_c1)} bonds returned C+1 in {fan_dt:.1f}s")
 
                 calcs = []
                 athena_bbg_rows = []
