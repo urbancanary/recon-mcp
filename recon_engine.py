@@ -557,6 +557,7 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
     def _payload(settle_iso: str) -> dict:
         inv_date = settle_iso.replace("-", "/")
         return {
+            "format": "FLDS",
             "data": [
                 {
                     "BOND_CD": isin,
@@ -582,14 +583,47 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
                 return {}
             return r.json()
 
+    async def _cashflow_periods(settle_iso: str) -> dict:
+        # Single batch lookup: which accrual period is each bond currently in?
+        # Returns {isin: {start_date, date, days_in_period}} for the period
+        # where start_date <= settle < date. last_coupon_date == start_date,
+        # next_coupon_date == date. Source: bond_cashflow_schedule (CBonds-fed)
+        # in the bond-data Supabase project.
+        try:
+            isin_filter = ",".join(isins)
+            async with httpx.AsyncClient(timeout=15.0) as c:
+                r = await c.get(
+                    f"{BOND_DATA_URL}/rest/v1/bond_cashflow_schedule",
+                    headers=_bond_data_headers(),
+                    params={
+                        "isin": f"in.({isin_filter})",
+                        "start_date": f"lte.{settle_iso}",
+                        "date": f"gt.{settle_iso}",
+                        "select": "isin,start_date,date,days_in_period",
+                    },
+                )
+            if r.status_code != 200:
+                logger.warning(f"cashflow_schedule fetch -> {r.status_code}: {r.text[:200]}")
+                return {}
+            return {row["isin"]: row for row in r.json() if row.get("isin")}
+        except Exception as e:
+            logger.warning(f"cashflow_schedule fetch failed (continuing without): {e!r}")
+            return {}
+
     try:
-        t0_resp, c1_resp = await asyncio.gather(_call(settle_t0), _call(settle_c1))
+        t0_resp, c1_resp, periods = await asyncio.gather(
+            _call(settle_t0),
+            _call(settle_c1),
+            _cashflow_periods(settle_c1),
+        )
     except Exception as e:
         logger.error("GA10 portfolio/analysis call failed: %r", e)
         return 0
 
     t0_bonds = {b.get("isin"): b for b in (t0_resp.get("bond_data") or []) if b.get("isin")}
     c1_bonds = {b.get("isin"): b for b in (c1_resp.get("bond_data") or []) if b.get("isin")}
+
+    settle_c1_dt = pd_dt + timedelta(days=1)
 
     # Engine hash from the GAE backend. Stored as calc_engine_pricing_id
     # post-Worker-bypass — column name kept for backward compat. Different
@@ -618,7 +652,25 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
         t0 = t0_bonds[isin]
         c1 = c1_bonds[isin]
         par = par_lookup.get(isin) or 0
+        period = periods.get(isin) or {}
+        last_coupon = period.get("start_date")  # = previous coupon date / accrual start
+        # Calendar days from last coupon to settle (BBG-style ACT count, matches
+        # BBG's "Accrued (N Days)" display). NOT the 30/360 day count GA10 returns
+        # in `accrued_days` — that field is unreliable on stub-period bonds.
+        days_accrued = None
+        if last_coupon:
+            try:
+                last_dt = datetime.strptime(last_coupon, "%Y-%m-%d")
+                days_accrued = (settle_c1_dt - last_dt).days
+            except (ValueError, TypeError):
+                pass
 
+        # GA10 FLDS labels for amortising bonds use non-Bloomberg vocabulary:
+        #   GA10 `ytm`  = with-sinks IRR  ←  BBG calls this "Average Life (Par)" / YTAL
+        #   GA10 `ytal` = bullet-at-WAL approximation (different math from BBG YTAL)
+        # `recon_bbg.yield_to_worst` exports BBG's primary yield (= "Average Life (Par)"
+        # for sinkers). Comparing GA10 `ytm` against `recon_bbg.yield_to_worst`
+        # gives a cent-level match. See codebase-mcp memory id=383.
         calcs.append({
             "isin": isin,
             "source_price": bbg_prices.get(isin),
@@ -627,17 +679,18 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
             "ga10_accrued_t1":  None,
             "ga10_accrued_t2":  None,
             "ga10_accrued_t3":  None,
-            "ga10_yield":       t0.get("yield"),
-            "ga10_yield_c1":    c1.get("yield"),
+            "ga10_yield":       t0.get("ytm"),
+            "ga10_yield_c1":    c1.get("ytm"),
             "ga10_yield_t1":    None,
-            "ga10_yield_worst": t0.get("yield"),
+            "ga10_yield_worst": t0.get("ytw") or t0.get("ytm"),
+            "ga10_ytal":        t0.get("ytal"),
             "ga10_duration":    t0.get("duration"),
-            "ga10_duration_worst": t0.get("duration"),
+            "ga10_duration_worst": t0.get("duration_worst") or t0.get("duration"),
             "ga10_spread":      t0.get("spread"),
-            "ga10_convexity":   None,
-            "ga10_dv01":        None,
+            "ga10_convexity":   t0.get("convexity"),
+            "ga10_dv01":        t0.get("pvbp"),
             "convention_used":  t0.get("day_count"),
-            "last_coupon_date": None,
+            "last_coupon_date": last_coupon,
             "issue_date":       None,
             # Provenance — drives v_stale_calcs / drift chip
             "calc_static_hash": static_hash_by_isin.get(isin),
@@ -662,8 +715,9 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
                 "accrued_t1": None,
                 "accrued_c2": None,
                 "accrued_c3": None,
-                "last_coupon_date": None,
-                "days_accrued": None,
+                "day_count": t0.get("day_count"),
+                "last_coupon_date": last_coupon,
+                "days_accrued": days_accrued,
             })
 
     if calcs:

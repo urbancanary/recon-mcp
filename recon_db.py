@@ -692,7 +692,8 @@ async def store_athena_bbg(portfolio_id: str, date: str, rows: list[dict]) -> in
     """Store Athena's calculations from BBG prices (absolute dollars, par-scaled).
     Removes bonds no longer in the set, then upserts.
 
-    Each row: {isin, par, source_price, accrued_t0, accrued_c1, accrued_t1, accrued_c2, accrued_c3}
+    Row fields: isin, par, source_price, accrued_t0, accrued_c1, accrued_t1,
+    accrued_c2, accrued_c3, day_count, last_coupon_date, days_accrued.
     """
     new_isins = {r.get("isin") for r in rows if r.get("isin")}
     if new_isins:
@@ -709,6 +710,9 @@ async def store_athena_bbg(portfolio_id: str, date: str, rows: list[dict]) -> in
         "accrued_t1": r.get("accrued_t1"),
         "accrued_c2": r.get("accrued_c2"),
         "accrued_c3": r.get("accrued_c3"),
+        "day_count": r.get("day_count"),
+        "last_coupon_date": r.get("last_coupon_date"),
+        "days_accrued": r.get("days_accrued"),
         "updated_at": now,
     } for r in rows]
     return await _upsert("athena_bbg", upsert_rows, "portfolio_id,date,isin")
