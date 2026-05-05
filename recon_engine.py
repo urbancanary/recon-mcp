@@ -581,6 +581,42 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
             )
             if resp.status_code == 200:
                 ga10_bonds = resp.json().get("bonds", [])
+
+                # /prices/by-date returns accrued_interest_c1=null for most
+                # bonds — the multi-settle calc inside one Worker invocation
+                # exhausts the CPU budget after the first bond. Fan out to
+                # /prices/accrued-live (one Worker per bond) to recover C+1.
+                ga10_by_isin = {b.get("isin"): b for b in ga10_bonds if b.get("isin") in isin_set}
+                needs_c1 = [
+                    (isin, b["bbg_settle_date"])
+                    for isin, b in ga10_by_isin.items()
+                    if b.get("accrued_interest_c1") is None and b.get("bbg_settle_date")
+                ]
+                c1_override: dict[str, dict] = {}
+                if needs_c1:
+                    logger.info(f"GA10 by-date c1=null on {len(needs_c1)}/{len(ga10_by_isin)} bonds — fanning out to accrued-live")
+
+                    async def _live_c1(isin: str, settle: str):
+                        try:
+                            r = await client.post(
+                                f"{GA10_PRICING_URL}/prices/accrued-live",
+                                json={"isins": [isin], "settlement_date": settle},
+                                timeout=120.0,
+                            )
+                            if r.status_code != 200:
+                                return isin, None
+                            bonds_resp = (r.json() or {}).get("bonds") or []
+                            return isin, (bonds_resp[0] if bonds_resp else None)
+                        except Exception as e:
+                            logger.warning(f"accrued-live {isin}: {e!r}")
+                            return isin, None
+
+                    fan_out = await asyncio.gather(*[_live_c1(i, s) for i, s in needs_c1])
+                    for isin, b_live in fan_out:
+                        if b_live and b_live.get("accrued_interest") is not None:
+                            c1_override[isin] = b_live
+                    logger.info(f"accrued-live fan-out: {len(c1_override)}/{len(needs_c1)} bonds returned C+1")
+
                 calcs = []
                 athena_bbg_rows = []
                 par_lookup = bbg_par or {}
@@ -588,8 +624,14 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
                     isin = b.get("isin")
                     if isin not in isin_set:
                         continue
+                    ov = c1_override.get(isin)
+                    ai_c1 = b.get("accrued_interest_c1")
+                    ytm_c1 = b.get("ytm_c1")
+                    if ai_c1 is None and ov is not None:
+                        ai_c1 = ov.get("accrued_interest")
+                        ytm_c1 = ov.get("yield_to_maturity")
                     # Skip bonds with no accrued at all (T+0 or C+1)
-                    if b.get("accrued_interest") is None and b.get("accrued_interest_c1") is None:
+                    if b.get("accrued_interest") is None and ai_c1 is None:
                         continue
                     par = par_lookup.get(isin) or 0
 
@@ -597,13 +639,12 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
                         "isin": isin,
                         "source_price": bbg_prices.get(isin),
                         "ga10_accrued": b.get("accrued_interest"),
-                        "ga10_accrued_c1": b.get("accrued_interest_c1"),
+                        "ga10_accrued_c1": ai_c1,
                         "ga10_accrued_t1": b.get("accrued_interest_t1"),
                         "ga10_accrued_t2": b.get("accrued_interest_t2"),
                         "ga10_accrued_t3": b.get("accrued_interest_t3"),
-                        # Use T+0 fields; C+1 can be garbage on weekends
                         "ga10_yield": b.get("yield_to_maturity"),
-                        "ga10_yield_c1": b.get("ytm_c1"),
+                        "ga10_yield_c1": ytm_c1,
                         "ga10_yield_t1": b.get("ytm_t1"),
                         "ga10_yield_worst": b.get("ytw_bbg") or b.get("yield_to_maturity"),
                         "ga10_duration": b.get("modified_duration"),
@@ -625,7 +666,7 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
                             "par": par,
                             "source_price": bbg_prices.get(isin),
                             "accrued_t0": _scale(b.get("accrued_interest")),
-                            "accrued_c1": _scale(b.get("accrued_interest_c1")),
+                            "accrued_c1": _scale(ai_c1),
                             "accrued_t1": _scale(b.get("accrued_interest_t1")),
                             "accrued_c2": _scale(b.get("accrued_interest_t2")),
                             "accrued_c3": _scale(b.get("accrued_interest_t3")),
