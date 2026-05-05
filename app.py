@@ -8,6 +8,7 @@ call this service for display-ready recon data.
 
 import asyncio
 import logging
+import os
 from datetime import datetime
 
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Request, BackgroundTasks
@@ -105,6 +106,28 @@ async def _backfill_missing_days_accrued():
 @app.on_event("startup")
 async def _startup():
     asyncio.create_task(_startup_backfill())
+    # Periodic safety-net for the calc-staleness detector. Set
+    # RECALC_STALE_INTERVAL_SECONDS=900 to run every 15 min. Unset = off.
+    interval_str = os.environ.get("RECALC_STALE_INTERVAL_SECONDS", "")
+    if interval_str.isdigit() and int(interval_str) > 0:
+        asyncio.create_task(_recalc_stale_loop(int(interval_str)))
+
+
+async def _recalc_stale_loop(interval_seconds: int):
+    """Periodic /recalc/stale runner. Calls the endpoint handler directly
+    to avoid an HTTP roundtrip. Errors log but do not break the loop.
+    """
+    import logging
+    log = logging.getLogger(__name__)
+    log.info(f"recalc_stale loop started (every {interval_seconds}s)")
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            result = await recalc_stale(limit=200)
+            if result.get("fired_isins", 0) > 0 or result.get("failures"):
+                log.info(f"recalc_stale_loop: {result}")
+        except Exception as e:
+            log.error(f"recalc_stale_loop error: {e!r}")
 
 
 # ── Health + manifest ──────────────────────────────────────────────────────

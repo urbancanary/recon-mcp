@@ -58,8 +58,12 @@ SELECT
   c.portfolio_id,
   c.date,
   c.isin,
-  (c.calc_static_hash IS NULL
-   OR c.calc_static_hash IS DISTINCT FROM r.current_static_hash) AS static_drift,
+  -- Drift only when reference hash exists AND calc hash is missing or different.
+  -- If r.current_static_hash IS NULL we cannot tell — leave alone. Avoids
+  -- cron looping forever on bonds with missing bond_reference data.
+  (r.current_static_hash IS NOT NULL
+   AND (c.calc_static_hash IS NULL
+        OR c.calc_static_hash <> r.current_static_hash)) AS static_drift,
   (NULLIF(current_setting('app.engine_pricing_id', true), '') IS NOT NULL
    AND (c.calc_engine_pricing_id IS NULL
         OR c.calc_engine_pricing_id <> current_setting('app.engine_pricing_id', true))) AS engine_pricing_drift,
@@ -70,13 +74,12 @@ SELECT
   r.current_static_hash,
   c.calc_engine_pricing_id,
   c.calc_engine_gateway_id,
-  c.calculated_at,
-  c.created_at
+  c.calculated_at
 FROM recon_calcs c
 LEFT JOIN local_bond_reference r ON r.isin = c.isin
-WHERE c.calc_static_hash IS NULL
-   OR r.current_static_hash IS NULL
-   OR c.calc_static_hash IS DISTINCT FROM r.current_static_hash
+WHERE (r.current_static_hash IS NOT NULL
+       AND (c.calc_static_hash IS NULL
+            OR c.calc_static_hash <> r.current_static_hash))
    OR (NULLIF(current_setting('app.engine_pricing_id', true), '') IS NOT NULL
        AND (c.calc_engine_pricing_id IS NULL
             OR c.calc_engine_pricing_id <> current_setting('app.engine_pricing_id', true)))
