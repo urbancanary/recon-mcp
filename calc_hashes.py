@@ -23,6 +23,13 @@ GA10_GATEWAY_URL = os.environ.get(
     "GA10_GATEWAY_URL",
     "https://ga10-gateway.urbancanary.workers.dev",
 )
+# GAE backend now in the recalc path directly (post-Worker-bypass).
+# Engine_hash from this URL is what gets stamped on recon_calcs and what
+# the cron compares against for engine-drift detection.
+GA10_BACKEND_URL = os.environ.get(
+    "GA10_BACKEND_URL",
+    "https://future-footing-414610.uc.r.appspot.com",
+)
 
 
 def compute_static_hash(ref: Optional[dict], identity: Optional[dict]) -> Optional[str]:
@@ -65,12 +72,16 @@ def compute_price_hash(price, price_date, source_table: str) -> Optional[str]:
 
 
 async def fetch_engine_version() -> dict:
-    """Fetch /engine/version from ga10-pricing and ga10-gateway.
+    """Fetch /engine/version from ga10-pricing, ga10-gateway, and the GAE backend.
 
-    Returns: {"pricing": {...} | None, "gateway": {...} | None}
-    Failures don't raise — they leave the failing layer as None, which the
-    consuming code should treat as drift (better to over-recalc than
-    silently keep stale rows).
+    Returns: {"pricing": {...} | None, "gateway": {...} | None, "backend": {...} | None}
+    Failures don't raise — they leave the failing layer as None.
+
+    Post-Worker-bypass (May 2026), only `backend` is in the recalc path —
+    its `hash` is what gets stamped on each recon_calcs row. The CF Worker
+    layers are kept here for legacy/observability and may be removed once
+    Option A is fully validated and the Worker /engine/version endpoints
+    are retired.
     """
     async def _get(url: str) -> Optional[dict]:
         if not url:
@@ -87,14 +98,20 @@ async def fetch_engine_version() -> dict:
 
     pricing = await _get(GA10_PRICING_URL)
     gateway = await _get(GA10_GATEWAY_URL)
-    return {"pricing": pricing, "gateway": gateway}
+    backend = await _get(GA10_BACKEND_URL)
+    return {"pricing": pricing, "gateway": gateway, "backend": backend}
 
 
 def engine_ids_from(engine_version: dict) -> tuple[Optional[str], Optional[str]]:
-    """Extract (pricing_id, gateway_id) from a fetch_engine_version() result."""
-    pricing = (engine_version or {}).get("pricing") or {}
+    """Extract (backend_hash, gateway_id) from a fetch_engine_version() result.
+
+    Backend hash takes the calc_engine_pricing_id slot (column kept for
+    backward compat). Gateway id retained for observability — column may
+    be retired once Workers are dropped from the path entirely.
+    """
+    backend = (engine_version or {}).get("backend") or {}
     gateway = (engine_version or {}).get("gateway") or {}
-    return pricing.get("version_id"), gateway.get("version_id")
+    return backend.get("hash"), gateway.get("version_id")
 
 
 def _fmt_num(v) -> Optional[str]:

@@ -591,6 +591,11 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
     t0_bonds = {b.get("isin"): b for b in (t0_resp.get("bond_data") or []) if b.get("isin")}
     c1_bonds = {b.get("isin"): b for b in (c1_resp.get("bond_data") or []) if b.get("isin")}
 
+    # Engine hash from the GAE backend. Stored as calc_engine_pricing_id
+    # post-Worker-bypass — column name kept for backward compat. Different
+    # response shapes during deploy: prefer t0, fall back to c1.
+    engine_backend_hash = t0_resp.get("engine_hash") or c1_resp.get("engine_hash")
+
     isin_set = set(isins)
     returned = isin_set & set(t0_bonds.keys()) & set(c1_bonds.keys())
     missing = sorted(isin_set - returned)
@@ -639,7 +644,7 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
             "calc_price_hash":  compute_price_hash(
                 bbg_prices.get(isin), price_date, "recon_bbg"
             ),
-            "calc_engine_pricing_id": None,
+            "calc_engine_pricing_id": engine_backend_hash,
             "calc_engine_gateway_id": None,
             "calculated_at": now_iso,
         })
