@@ -729,16 +729,17 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
             except (ValueError, TypeError):
                 pass
 
-        # GA10 FLDS labels for amortising bonds use non-Bloomberg vocabulary:
-        #   GA10 `ytm`  = with-sinks IRR  ←  BBG calls this "Average Life (Par)" / YTAL
-        #   GA10 `ytal` = bullet-at-WAL approximation (different math from BBG YTAL)
-        # `recon_bbg.yield_to_worst` exports BBG's primary yield (= "Average Life (Par)"
-        # for sinkers). Comparing GA10 `ytm` against `recon_bbg.yield_to_worst`
-        # gives a cent-level match. See codebase-mcp memory id=383.
-        # For callable bonds, callable_ytw[isin] is the per-bond override result
-        # (FLDS batch can't see call_date, so YTW would otherwise = YTM and miss
-        # the call — see codebase-mcp memory id=384).
-        ytw_value = callable_ytw.get(isin) or t0.get("ytw") or t0.get("ytm")
+        # GA10 FLDS yield field semantics:
+        #   ytm   = pure yield to maturity (bullet at maturity, ignores sinks)
+        #   ytal  = with-sinks IRR / Average Life (Par) — BBG-comparable for amortisers
+        #   yield = convention-aware preferred yield (ytm for non-amort, ytal for amort)
+        # BBG's `yield_to_worst` export is BBG's convention-aware default (ytm for
+        # vanilla, "Average Life Par" for sinkers). Use FLDS `yield` to mirror
+        # that semantics — it's the right comparator field across both bond
+        # types. See codebase-mcp memory id=383.
+        # For callable bonds, callable_ytw[isin] overrides since FLDS batch
+        # ignores per-row call overrides — see memory id=384.
+        ytw_value = callable_ytw.get(isin) or t0.get("yield") or t0.get("ytm")
         calcs.append({
             "isin": isin,
             "source_price": bbg_prices.get(isin),
@@ -747,8 +748,8 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
             "ga10_accrued_t1":  None,
             "ga10_accrued_t2":  None,
             "ga10_accrued_t3":  None,
-            "ga10_yield":       t0.get("ytm"),
-            "ga10_yield_c1":    c1.get("ytm"),
+            "ga10_yield":       t0.get("yield"),
+            "ga10_yield_c1":    c1.get("yield"),
             "ga10_yield_t1":    None,
             "ga10_yield_worst": ytw_value,
             "ga10_ytal":        t0.get("ytal"),
