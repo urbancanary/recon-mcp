@@ -610,15 +610,79 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
             logger.warning(f"cashflow_schedule fetch failed (continuing without): {e!r}")
             return {}
 
+    async def _call_schedule() -> dict:
+        # Returns {isin: call_date} for any bond with a call date populated in
+        # bond_reference. CBonds doesn't always supply call_date even when a
+        # call exists (see codebase-mcp memory id=384), so this column is
+        # backfilled manually from BBG for the bonds that matter. GA10 FLDS
+        # batch ignores per-row overrides; we use these dates to fan out a
+        # per-bond /api/v1/bond/analysis with overrides for callable bonds
+        # only, then graft the corrected ytw onto the batched calc.
+        try:
+            isin_filter = ",".join(isins)
+            async with httpx.AsyncClient(timeout=15.0) as c:
+                r = await c.get(
+                    f"{BOND_DATA_URL}/rest/v1/bond_reference",
+                    headers=_bond_data_headers(),
+                    params={
+                        "isin": f"in.({isin_filter})",
+                        "call_date": "not.is.null",
+                        "select": "isin,call_date",
+                    },
+                )
+            if r.status_code != 200:
+                logger.warning(f"call_schedule fetch -> {r.status_code}: {r.text[:200]}")
+                return {}
+            return {row["isin"]: row["call_date"] for row in r.json() if row.get("call_date")}
+        except Exception as e:
+            logger.warning(f"call_schedule fetch failed (continuing without): {e!r}")
+            return {}
+
     try:
-        t0_resp, c1_resp, periods = await asyncio.gather(
+        t0_resp, c1_resp, periods, call_dates = await asyncio.gather(
             _call(settle_t0),
             _call(settle_c1),
             _cashflow_periods(settle_c1),
+            _call_schedule(),
         )
     except Exception as e:
         logger.error("GA10 portfolio/analysis call failed: %r", e)
         return 0
+
+    # For each callable bond, hit /api/v1/bond/analysis with explicit
+    # overrides so GA10 actually prices the call (FLDS batch ignores
+    # per-row overrides). Default call_price=100 — par calls are the
+    # common case; if a bond ever has a premium call, extend later.
+    callable_ytw: dict[str, float] = {}
+    if call_dates:
+        async def _ytw_with_call(isin: str, call_date: str):
+            try:
+                payload = {
+                    "isin": isin,
+                    "price": float(bbg_prices.get(isin)),
+                    "settlement_date": settle_t0,
+                    "overrides": {"call_date": call_date, "call_price": 100},
+                }
+                async with httpx.AsyncClient(timeout=30.0) as c:
+                    r = await c.post(
+                        f"{GAE_URL}/api/v1/bond/analysis",
+                        json=payload,
+                        headers={"Content-Type": "application/json", "X-API-Key": api_key},
+                    )
+                if r.status_code != 200:
+                    logger.warning(f"bond/analysis call-override {isin}: HTTP {r.status_code}")
+                    return isin, None
+                analytics = (r.json() or {}).get("analytics") or {}
+                return isin, analytics.get("ytw")
+            except Exception as e:
+                logger.warning(f"bond/analysis call-override {isin}: {e!r}")
+                return isin, None
+
+        results = await asyncio.gather(*[_ytw_with_call(i, d) for i, d in call_dates.items()])
+        for isin, ytw in results:
+            if ytw is not None:
+                callable_ytw[isin] = ytw
+        logger.info(f"call-override fan-out: {len(callable_ytw)}/{len(call_dates)} callable bonds priced")
 
     t0_bonds = {b.get("isin"): b for b in (t0_resp.get("bond_data") or []) if b.get("isin")}
     c1_bonds = {b.get("isin"): b for b in (c1_resp.get("bond_data") or []) if b.get("isin")}
@@ -671,6 +735,10 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
         # `recon_bbg.yield_to_worst` exports BBG's primary yield (= "Average Life (Par)"
         # for sinkers). Comparing GA10 `ytm` against `recon_bbg.yield_to_worst`
         # gives a cent-level match. See codebase-mcp memory id=383.
+        # For callable bonds, callable_ytw[isin] is the per-bond override result
+        # (FLDS batch can't see call_date, so YTW would otherwise = YTM and miss
+        # the call — see codebase-mcp memory id=384).
+        ytw_value = callable_ytw.get(isin) or t0.get("ytw") or t0.get("ytm")
         calcs.append({
             "isin": isin,
             "source_price": bbg_prices.get(isin),
@@ -682,7 +750,7 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
             "ga10_yield":       t0.get("ytm"),
             "ga10_yield_c1":    c1.get("ytm"),
             "ga10_yield_t1":    None,
-            "ga10_yield_worst": t0.get("ytw") or t0.get("ytm"),
+            "ga10_yield_worst": ytw_value,
             "ga10_ytal":        t0.get("ytal"),
             "ga10_duration":    t0.get("duration"),
             "ga10_duration_worst": t0.get("duration_worst") or t0.get("duration"),
