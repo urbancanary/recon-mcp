@@ -740,6 +740,14 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
         # For callable bonds, callable_ytw[isin] overrides since FLDS batch
         # ignores per-row call overrides — see memory id=384.
         ytw_value = callable_ytw.get(isin) or t0.get("yield") or t0.get("ytm")
+
+        # FLDS `yield_convention` is "YTM" / "YTAL" / "YTW" — derived inside GA10
+        # from is_amortizing + call schedule. FLDS doesn't see manual call
+        # overrides, so for our callable bonds we force "YTW" to reflect the
+        # call workout that the override actually priced.
+        yield_convention = t0.get("yield_convention")
+        if isin in callable_ytw:
+            yield_convention = "YTW"
         calcs.append({
             "isin": isin,
             "source_price": bbg_prices.get(isin),
@@ -753,6 +761,7 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
             "ga10_yield_t1":    None,
             "ga10_yield_worst": ytw_value,
             "ga10_ytal":        t0.get("ytal"),
+            "ga10_yield_convention": yield_convention,
             "ga10_duration":    t0.get("duration"),
             "ga10_duration_worst": t0.get("duration_worst") or t0.get("duration"),
             "ga10_spread":      t0.get("spread"),
