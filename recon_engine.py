@@ -276,7 +276,7 @@ async def _store_admin_prices_to_bond_data(admin_bonds: list[dict], price_date: 
         headers = {**_bond_data_headers(), "Prefer": "return=minimal,resolution=merge-duplicates"}
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
-                f"{BOND_DATA_URL}/rest/v1/bond_analytics_dated?on_conflict=isin,price_date,source",
+                f"{BOND_DATA_URL}/rest/v1/bond_analytics_dated?on_conflict=isin,price_date,source,provider_detail",
                 headers=headers,
                 json=rows,
             )
