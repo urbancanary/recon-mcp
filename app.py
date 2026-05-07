@@ -614,6 +614,79 @@ async def webhook_static_changed(request: Request, background_tasks: BackgroundT
     }
 
 
+@app.post("/sweep/refresh-athena")
+async def sweep_refresh_athena(request: Request):
+    """Synchronous bulk refresh of athena_bbg/recon_calcs for a list of ISINs.
+
+    Driven by the ga10-pricing-mcp 5-min cron after recalcHistory bumps
+    bond_analytics_dated. Per-ISIN result lets the caller decide whether to
+    bump prior_calc_hash (only on success) so failed ISINs are retried next
+    tick. Replaces the bond_identity webhook trigger.
+
+    Auth: X-Webhook-Secret header must match WEBHOOK_SECRET env var.
+    Body: {"isins": ["XS...", ...]}  (1-200)
+    """
+    import os, httpx
+    secret = os.environ.get("WEBHOOK_SECRET")
+    if secret and request.headers.get("X-Webhook-Secret", "") != secret:
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+    body = await request.json()
+    isins = body.get("isins")
+    if not isinstance(isins, list) or not isins:
+        raise HTTPException(status_code=400, detail="body.isins must be a non-empty list")
+    if len(isins) > 200:
+        raise HTTPException(status_code=400, detail="max 200 isins per call")
+
+    from recon_db import SUPABASE_URL, _headers
+    isins_succeeded: list[str] = []
+    isins_failed: list[dict] = []
+    total_refreshed = 0
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        for isin in isins:
+            try:
+                resp = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/athena_bbg",
+                    headers=_headers(),
+                    params={"isin": f"eq.{isin}", "select": "portfolio_id,date"},
+                )
+                if resp.status_code != 200:
+                    isins_failed.append({"isin": isin, "error": f"athena_bbg fetch {resp.status_code}"})
+                    continue
+
+                combos = {(r["portfolio_id"], r["date"]) for r in resp.json()}
+                if not combos:
+                    isins_succeeded.append(isin)
+                    continue
+
+                results = await asyncio.gather(
+                    *[_recalc_accrued(pid, dt, force=True) for pid, dt in combos],
+                    return_exceptions=True,
+                )
+                errors = [r for r in results if isinstance(r, Exception)]
+                if errors:
+                    isins_failed.append({"isin": isin, "error": str(errors[0])[:200]})
+                else:
+                    isins_succeeded.append(isin)
+                    total_refreshed += len(combos)
+            except Exception as e:
+                logger.exception("sweep_refresh_athena: isin=%s failed", isin)
+                isins_failed.append({"isin": isin, "error": str(e)[:200]})
+
+    logger.info(
+        "sweep_refresh_athena: requested=%d succeeded=%d failed=%d portfolio_dates_refreshed=%d",
+        len(isins), len(isins_succeeded), len(isins_failed), total_refreshed,
+    )
+
+    return {
+        "requested": len(isins),
+        "isins_succeeded": isins_succeeded,
+        "isins_failed": isins_failed,
+        "portfolio_dates_refreshed": total_refreshed,
+    }
+
+
 @app.post("/enrich/from-recon-bbg")
 async def enrich_from_recon_bbg(portfolio_id: str = None):
     """Backfill local_bond_identity and local_bond_reference with maturity dates
