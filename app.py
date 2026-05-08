@@ -568,14 +568,29 @@ async def webhook_static_changed(request: Request, background_tasks: BackgroundT
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
     body = await request.json()
-    record = body.get("record") or body.get("old_record") or {}
-    isin = record.get("isin")
+    record = body.get("record") or {}
+    old_record = body.get("old_record") or {}
+    isin = record.get("isin") or old_record.get("isin")
     if not isin:
         return {"status": "ignored", "reason": "no ISIN in payload"}
 
     table      = body.get("table", "unknown")
     event_type = body.get("type", "unknown")
     logger.info("webhook_static_changed: %s on %s isin=%s", event_type, table, isin)
+
+    # Detect whether calc-affecting static actually changed. The Postgres trigger
+    # fires on every UPDATE (e.g. source/source_description churn), so without
+    # this guard we'd thrash ga10-pricing-mcp on no-op edits. We compare the
+    # incoming and prior calc_hash; if old_record had no hash it's a first-write
+    # and there's no historical analytics to recalc.
+    new_calc_hash = record.get("calc_hash")
+    old_calc_hash = old_record.get("calc_hash")
+    calc_changed = (
+        table == "bond_identity"
+        and new_calc_hash
+        and old_calc_hash
+        and new_calc_hash != old_calc_hash
+    )
 
     # Find every (portfolio_id, date) for this ISIN that we have accrued data for
     from recon_db import SUPABASE_URL, _headers
@@ -589,8 +604,43 @@ async def webhook_static_changed(request: Request, background_tasks: BackgroundT
         raise HTTPException(status_code=502, detail=f"athena_bbg fetch failed: {resp.status_code}")
 
     combos = {(r["portfolio_id"], r["date"]) for r in resp.json()}
+
+    # Fast path for static corrections during demos: when calc_hash bumps,
+    # ping ga10-pricing-mcp /recalc-history immediately so bond_analytics_dated
+    # gets rewritten without waiting up to 5 min for the next pricing cron.
+    # The cron's syncPendingStaticChanges -> recalcHistory pass remains the
+    # safety net: if this HTTP call fails or GA10_PRICING_URL is unset, the
+    # next cron tick still picks up the calc_hash drift and recalcs.
+    ga10_url = os.environ.get("GA10_PRICING_URL")
+    webhook_secret = os.environ.get("WEBHOOK_SECRET")
+
+    async def _ping_ga10_recalc():
+        if not (calc_changed and ga10_url):
+            return
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.post(
+                    f"{ga10_url.rstrip('/')}/recalc-history",
+                    json={"isins": [isin]},
+                    headers={"X-Webhook-Secret": webhook_secret or ""},
+                )
+                logger.info(
+                    "webhook_static_changed ga10 recalc-history: isin=%s status=%s",
+                    isin, r.status_code,
+                )
+        except Exception as e:
+            logger.warning("webhook_static_changed ga10 recalc-history failed: %s", e)
+
+    background_tasks.add_task(_ping_ga10_recalc)
+
     if not combos:
-        return {"status": "ok", "isin": isin, "recalculated": 0, "message": "ISIN not in athena_bbg"}
+        return {
+            "status": "ok",
+            "isin": isin,
+            "recalculated": 0,
+            "calc_changed": calc_changed,
+            "message": "ISIN not in athena_bbg",
+        }
 
     async def _run_recalcs():
         results = await asyncio.gather(
@@ -609,6 +659,7 @@ async def webhook_static_changed(request: Request, background_tasks: BackgroundT
         "status": "ok",
         "isin": isin,
         "table": table,
+        "calc_changed": calc_changed,
         "portfolio_dates_queued": len(combos),
         "combos": [{"portfolio_id": p, "date": d} for p, d in sorted(combos)],
     }
