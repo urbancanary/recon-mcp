@@ -605,33 +605,11 @@ async def webhook_static_changed(request: Request, background_tasks: BackgroundT
 
     combos = {(r["portfolio_id"], r["date"]) for r in resp.json()}
 
-    # Fast path for static corrections during demos: when calc_hash bumps,
-    # ping ga10-pricing-mcp /recalc-history immediately so bond_analytics_dated
-    # gets rewritten without waiting up to 5 min for the next pricing cron.
-    # The cron's syncPendingStaticChanges -> recalcHistory pass remains the
-    # safety net: if this HTTP call fails or GA10_PRICING_URL is unset, the
-    # next cron tick still picks up the calc_hash drift and recalcs.
-    ga10_url = os.environ.get("GA10_PRICING_URL")
-    webhook_secret = os.environ.get("WEBHOOK_SECRET")
-
-    async def _ping_ga10_recalc():
-        if not (calc_changed and ga10_url):
-            return
-        try:
-            async with httpx.AsyncClient(timeout=15) as c:
-                r = await c.post(
-                    f"{ga10_url.rstrip('/')}/recalc-history",
-                    json={"isins": [isin]},
-                    headers={"X-Webhook-Secret": webhook_secret or ""},
-                )
-                logger.info(
-                    "webhook_static_changed ga10 recalc-history: isin=%s status=%s",
-                    isin, r.status_code,
-                )
-        except Exception as e:
-            logger.warning("webhook_static_changed ga10 recalc-history failed: %s", e)
-
-    background_tasks.add_task(_ping_ga10_recalc)
+    # Recalc fan-out is owned by the bond_recalc_queue + trg_notify_ga10_recalc
+    # path on the bond-data Supabase. recon-mcp no longer pings ga10-pricing-mcp
+    # for calc-history rewrites — that responsibility belongs upstream of us.
+    # We still refresh athena_bbg below so portfolio recon picks up the new
+    # static immediately.
 
     if not combos:
         return {
