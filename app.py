@@ -993,201 +993,208 @@ async def recalc_stale(limit: int = 200):
 
 @app.get("/recon/athena-v-ga10")
 async def athena_v_ga10(portfolio_id: str = "wnbf", date: str = None):
-    """Compare stored GA10 v3 bond_analytics against fresh v4 recalculation.
+    """Detect static drift in stored bond_analytics_dated via calc_hash compare.
 
-    Athena displays stored v3 results. This endpoint recalculates each bond
-    via GA10 v4 gateway with the same price to catch:
-    - Convention drift (coupon, day count, frequency changes)
-    - Engine version differences (v3 vs v4)
-    - Stale carried-forward data
-    - Description mismatches vs bond_identity
+    No GA10 recalc — relies on the calc_hash stamping mechanism. When
+    bond_identity.calc_hash differs from bond_analytics_dated.calc_hash, the
+    static (coupon, day-count, maturity, etc.) has changed since the row
+    was last stamped and the hopper needs to recompute it.
 
-    Calls are batched concurrently (5 at a time) to stay within timeout.
+    Replaces the previous per-bond GA10 v3 /bond/analysis recompute (~2s
+    per call × N bonds = often >30s and timing out at Railway's HTTP cap,
+    producing the "Internal Server Error" the Athena recon page rendered
+    as an Unexpected token JSON parse error). Now ~1s for any portfolio
+    size because all work is in 2 batched Supabase queries.
+
+    Description mismatch logic preserved: compares the stored row's
+    description against v_bond_identity_resolved.description, flags
+    desc_mismatches for the summary panel.
+
+    Response shape preserved so the calc-drift widget keeps rendering.
+    When calc_hash matches: fresh = stored, diff = zeros, drift = false
+    (the stamp is the proof). When calc_hash differs: fresh = null,
+    diff = null, drift = true with an "error" message naming the cause.
     """
     if not date:
         raise HTTPException(status_code=400, detail="date parameter required")
 
-    import os
     import httpx
     import asyncio
 
-    ga10_url = os.environ.get("GA10_PRICING_URL", "")
-    gw_url = os.environ.get("GA10_GATEWAY_URL", "")
-    # Use v3 until v4 is deployed on the gateway, then switch via env var
-    gw_version = os.environ.get("GA10_RECON_VERSION", "v3")
+    from recon_db import (
+        SUPABASE_URL, BOND_DATA_URL,
+        _headers, _bond_data_headers,
+    )
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        # 1. Fetch stored bond_analytics + portfolio holdings + bond_identity in parallel
-        from recon_db import SUPABASE_URL, _headers
-
-        stored_task = client.get(f"{ga10_url}/prices/by-date?date={date}")
-        bbg_task = client.get(
-            f"{SUPABASE_URL}/rest/v1/recon_bbg",
-            headers=_headers(),
-            params={
-                "portfolio_id": f"eq.{portfolio_id}",
-                "date": f"eq.{date}",
-                "select": "isin,par,price,description",
-            },
-        ) if portfolio_id else None
-        identity_task = client.get(
-            f"{SUPABASE_URL}/rest/v1/local_bond_identity",
-            headers=_headers(),
-            params={"select": "isin,branded_description,branded_ticker"},
-        )
-
-        tasks = [stored_task, identity_task]
-        if bbg_task:
-            tasks.append(bbg_task)
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
-
-        stored_resp = responses[0]
-        identity_resp = responses[1]
-        bbg_resp = responses[2] if bbg_task else None
-
-        if isinstance(stored_resp, Exception) or stored_resp.status_code != 200:
-            raise HTTPException(status_code=502, detail="ga10-pricing fetch failed")
-        all_bonds = stored_resp.json().get("bonds", [])
-
-        # Build identity lookup for description recon
-        identity_map = {}
-        if not isinstance(identity_resp, Exception) and identity_resp.status_code == 200:
-            for row in identity_resp.json():
-                identity_map[row["isin"]] = row
-
-        # Build portfolio filter
-        portfolio_isins = None
-        if bbg_resp and not isinstance(bbg_resp, Exception) and bbg_resp.status_code == 200:
-            rows = bbg_resp.json()
-            if rows:
-                portfolio_isins = {r["isin"]: r for r in rows}
-
-        # Filter to portfolio bonds or CBonds watchlist bonds
-        if portfolio_isins:
-            bonds = [b for b in all_bonds if b["isin"] in portfolio_isins]
+    async with httpx.AsyncClient(timeout=30) as client:
+        # 1. Portfolio bonds from recon_bbg (gives ISIN universe + bbg price/desc).
+        if portfolio_id:
+            bbg_resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/recon_bbg",
+                headers=_headers(),
+                params={
+                    "portfolio_id": f"eq.{portfolio_id}",
+                    "date": f"eq.{date}",
+                    "select": "isin,par,price,description",
+                },
+            )
+            bbg_rows = bbg_resp.json() if bbg_resp.status_code == 200 else []
         else:
-            bonds = [b for b in all_bonds if b.get("source") in ("scheduled_job", "carried_forward", "BBG")]
+            bbg_rows = []
 
-        if not bonds:
+        portfolio_isins = [r["isin"] for r in bbg_rows if r.get("isin")]
+        bbg_map = {r["isin"]: r for r in bbg_rows}
+
+        if not portfolio_isins:
             return {
                 "portfolio_id": portfolio_id,
                 "date": date,
                 "bonds": [],
                 "count": 0,
-                "summary": {"total": 0, "matched": 0, "drifted": 0, "desc_mismatches": 0},
+                "summary": {"total": 0, "matched": 0, "drifted": 0, "desc_mismatches": 0,
+                            "engine": {"stored": "ga10-stamped", "fresh": "calc_hash_compare"},
+                            "thresholds": {"ytm_bps": 5, "duration": 0.1, "spread_bps": 10}},
             }
 
-        # 2. Recalculate bonds via GA10 v4 gateway — batched concurrently
-        BATCH_SIZE = 5
+        # 2. Stored analytics + current identity (parallel, filtered to portfolio ISINs).
+        isin_list = ",".join(portfolio_isins)
+        analytics_task = client.get(
+            f"{BOND_DATA_URL}/rest/v1/bond_analytics_dated",
+            headers=_bond_data_headers(),
+            params={
+                "isin": f"in.({isin_list})",
+                "price_date": f"eq.{date}",
+                "source": "in.(scheduled_job,carried_forward,BBG)",
+                "select": (
+                    "isin,source,provider_detail,price,description,"
+                    "yield_to_maturity,modified_duration,spread,accrued_interest,"
+                    "calc_hash"
+                ),
+                "order": "isin.asc,source.asc",
+            },
+        )
+        identity_task = client.get(
+            f"{BOND_DATA_URL}/rest/v1/v_bond_identity_resolved",
+            headers=_bond_data_headers(),
+            params={
+                "isin": f"in.({isin_list})",
+                "select": "isin,description,calc_hash",
+            },
+        )
 
-        async def calc_one(stored_bond):
-            isin = stored_bond["isin"]
-            price = stored_bond.get("price")
-            if not price:
-                return None
-            try:
-                resp = await client.post(
-                    f"{gw_url}/api/{gw_version}/bond/analysis",
-                    json={"isin": isin, "price": price, "settlement_date": date},
-                    timeout=20,
-                )
-                if resp.status_code == 200:
-                    return {"isin": isin, "analytics": resp.json().get("analytics", {})}
-                return {"isin": isin, "error": f"GA10 {gw_version} {resp.status_code}"}
-            except Exception as e:
-                return {"isin": isin, "error": str(e)}
+        analytics_resp, identity_resp = await asyncio.gather(
+            analytics_task, identity_task, return_exceptions=True
+        )
 
-        fresh_results = {}
-        for i in range(0, len(bonds), BATCH_SIZE):
-            batch = bonds[i:i + BATCH_SIZE]
-            batch_results = await asyncio.gather(*[calc_one(b) for b in batch])
-            for r in batch_results:
-                if r:
-                    fresh_results[r["isin"]] = r
+        if isinstance(analytics_resp, Exception) or analytics_resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="bond_analytics_dated fetch failed")
+        analytics_rows = analytics_resp.json()
 
-        # 3. Compare stored vs fresh + description recon
+        identity_map = {}
+        if not isinstance(identity_resp, Exception) and identity_resp.status_code == 200:
+            for row in identity_resp.json():
+                identity_map[row["isin"]] = row
+
+        # Pick the best analytics row per ISIN — prefer scheduled_job > BBG > carried_forward.
+        # Ordering done in SQL gives us one row per ISIN in source.asc; iterate and keep first.
+        priority = {"scheduled_job": 0, "BBG": 1, "carried_forward": 2}
+        chosen: dict[str, dict] = {}
+        for row in analytics_rows:
+            isin = row["isin"]
+            existing = chosen.get(isin)
+            if existing is None:
+                chosen[isin] = row
+                continue
+            if priority.get(row["source"], 99) < priority.get(existing["source"], 99):
+                chosen[isin] = row
+
+        # 3. Build comparison + summary.
         results = []
         drifted = 0
         desc_mismatches = 0
 
-        for stored in bonds:
-            isin = stored["isin"]
-            price = stored.get("price")
-            if not price:
+        for isin in portfolio_isins:
+            stored = chosen.get(isin)
+            bbg = bbg_map.get(isin, {})
+            identity = identity_map.get(isin, {})
+
+            stored_desc = (stored or {}).get("description") or bbg.get("description")
+            identity_desc = identity.get("description")
+            desc_match = True
+            if stored_desc and identity_desc and stored_desc.strip() != identity_desc.strip():
+                desc_match = False
+                desc_mismatches += 1
+
+            if not stored:
+                # No stored analytics row for this ISIN on this date — flag as drifted.
+                results.append({
+                    "isin": isin,
+                    "source": None,
+                    "price": bbg.get("price"),
+                    "description": {"stored": stored_desc, "identity": identity_desc, "match": desc_match},
+                    "stored": {"ytm": None, "duration": None, "spread": None, "accrued": None},
+                    "fresh": {"ytm": None, "duration": None, "spread": None, "accrued": None},
+                    "diff": {"ytm_bps": None, "duration": None, "spread": None, "accrued": None},
+                    "drift": True,
+                    "error": "no stored analytics row for this date",
+                })
+                drifted += 1
                 continue
 
             s_ytm = stored.get("yield_to_maturity") or 0
             s_dur = stored.get("modified_duration") or 0
             s_spr = stored.get("spread") or 0
             s_accrued = stored.get("accrued_interest") or 0
-            source = stored.get("source", "unknown")
+            row_hash = stored.get("calc_hash")
+            curr_hash = identity.get("calc_hash")
 
-            # Description recon: stored vs bond_identity
-            stored_desc = stored.get("description")
-            if not stored_desc:
-                conv = stored.get("conventions") or {}
-                stored_desc = conv.get("description")
-            identity_desc = identity_map.get(isin, {}).get("branded_description")
-            desc_match = True
-            if stored_desc and identity_desc and stored_desc.strip() != identity_desc.strip():
-                desc_match = False
-                desc_mismatches += 1
+            hash_match = bool(row_hash) and bool(curr_hash) and row_hash == curr_hash
 
-            fresh = fresh_results.get(isin, {})
-            if fresh.get("error"):
+            if hash_match:
+                # Stamp is valid — stored values are good. Show fresh=stored, no diff.
                 results.append({
-                    "isin": isin, "source": source, "price": price,
+                    "isin": isin,
+                    "source": stored.get("source"),
+                    "price": stored.get("price"),
                     "description": {"stored": stored_desc, "identity": identity_desc, "match": desc_match},
-                    "error": fresh["error"],
+                    "stored": {
+                        "ytm": round(s_ytm, 4),
+                        "duration": round(s_dur, 3),
+                        "spread": round(s_spr, 1),
+                        "accrued": round(s_accrued, 4),
+                    },
+                    "fresh": {
+                        "ytm": round(s_ytm, 4),
+                        "duration": round(s_dur, 3),
+                        "spread": round(s_spr, 1),
+                        "accrued": round(s_accrued, 4),
+                    },
+                    "diff": {"ytm_bps": 0, "duration": 0, "spread": 0, "accrued": 0},
+                    "drift": False,
                 })
-                continue
-
-            a = fresh.get("analytics", {})
-            f_ytm = a.get("ytm") or a.get("yield_to_maturity") or 0
-            f_dur = a.get("duration") or a.get("modified_duration") or 0
-            f_spr = a.get("spread") or a.get("z_spread") or 0
-            f_accrued = a.get("accrued_interest") or 0
-
-            d_ytm_bps = round((s_ytm - f_ytm) * 100, 1)
-            d_dur = round(s_dur - f_dur, 3)
-            d_spr = round(s_spr - f_spr, 1)
-            d_accrued = round(s_accrued - f_accrued, 4)
-
-            has_drift = abs(d_ytm_bps) > 5 or abs(d_dur) > 0.1 or abs(d_spr) > 10
-            if has_drift:
+            else:
+                # calc_hash mismatch — static drifted since this row was stamped.
+                # Surface the hashes so a recon viewer can see the proof of drift.
+                results.append({
+                    "isin": isin,
+                    "source": stored.get("source"),
+                    "price": stored.get("price"),
+                    "description": {"stored": stored_desc, "identity": identity_desc, "match": desc_match},
+                    "stored": {
+                        "ytm": round(s_ytm, 4),
+                        "duration": round(s_dur, 3),
+                        "spread": round(s_spr, 1),
+                        "accrued": round(s_accrued, 4),
+                    },
+                    "fresh": {"ytm": None, "duration": None, "spread": None, "accrued": None},
+                    "diff": {"ytm_bps": None, "duration": None, "spread": None, "accrued": None},
+                    "drift": True,
+                    "hashes": {"stamped": row_hash, "current": curr_hash},
+                    "error": "static drifted since stamp — hopper needs to recompute",
+                })
                 drifted += 1
 
-            results.append({
-                "isin": isin,
-                "description": {
-                    "stored": stored_desc,
-                    "identity": identity_desc,
-                    "match": desc_match,
-                },
-                "source": source,
-                "price": price,
-                "stored": {
-                    "ytm": round(s_ytm, 4),
-                    "duration": round(s_dur, 3),
-                    "spread": round(s_spr, 1),
-                    "accrued": round(s_accrued, 4),
-                },
-                "fresh": {
-                    "ytm": round(f_ytm, 4),
-                    "duration": round(f_dur, 3),
-                    "spread": round(f_spr, 1),
-                    "accrued": round(f_accrued, 4),
-                },
-                "diff": {
-                    "ytm_bps": d_ytm_bps,
-                    "duration": d_dur,
-                    "spread": d_spr,
-                    "accrued": d_accrued,
-                },
-                "drift": has_drift,
-            })
-
-        # Sort: drifted bonds first, then desc mismatches, then by ISIN
+        # Sort: drifted bonds first, then desc mismatches, then by ISIN.
         results.sort(key=lambda r: (
             not r.get("drift", False),
             r.get("description", {}).get("match", True),
@@ -1204,7 +1211,7 @@ async def athena_v_ga10(portfolio_id: str = "wnbf", date: str = None):
                 "matched": len(results) - drifted,
                 "drifted": drifted,
                 "desc_mismatches": desc_mismatches,
-                "engine": {"stored": "v3", "fresh": gw_version},
+                "engine": {"stored": "ga10-stamped", "fresh": "calc_hash_compare"},
                 "thresholds": {"ytm_bps": 5, "duration": 0.1, "spread_bps": 10},
             },
         }
