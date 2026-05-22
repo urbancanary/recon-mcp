@@ -11,6 +11,7 @@ Uses SLACK_BOT_TOKEN from auth-mcp. Fails silently (never blocks the pipeline).
 """
 
 import logging
+import os
 import httpx
 from datetime import datetime
 
@@ -19,6 +20,15 @@ logger = logging.getLogger(__name__)
 SLACK_CHANNEL = "recon-alerts"
 _bot_token: str | None = None
 _token_loaded = False
+
+
+def _alerts_enabled() -> bool:
+    """Kill switch — set SLACK_ALERTS_ENABLED="false" on the Railway service
+    to pause Slack notifications without redeploying. Default false 2026-05-22
+    while the #recon-alerts channel is being sorted (was firing continuously).
+    Flip the Railway env var to "true" to re-enable.
+    """
+    return os.environ.get("SLACK_ALERTS_ENABLED", "false").lower() == "true"
 
 
 def _get_token() -> str | None:
@@ -40,6 +50,8 @@ async def send_alert(title: str, message: str, level: str = "warning", fields: d
     level: "info", "warning", "error"
     fields: optional dict of key-value pairs to show as structured fields
     """
+    if not _alerts_enabled():
+        return  # paused via SLACK_ALERTS_ENABLED env var
     token = _get_token()
     if not token:
         logger.warning(f"Slack alert skipped (no token): {title}: {message}")
