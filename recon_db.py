@@ -20,26 +20,28 @@ logger = logging.getLogger(__name__)
 
 SUPABASE_URL = "https://iociqthaxysqqqamonqa.supabase.co"
 
-# Athena Supabase anon key — RLS disabled on recon tables
+# Supabase keys come from auth-mcp — NO hard-coded fallback. This service
+# stores client valuation data; a silently-working baked-in anon key is
+# exactly the failure mode the auth-mcp rules exist to prevent (unrotatable,
+# invisible to audit). Fail loud instead: every caller surfaces the error and
+# the fix is `auth-mcp` / a restart, not a code change.
 _key_loaded = False
 SUPABASE_KEY = ""
 
 
 def _ensure_key():
     global SUPABASE_KEY, _key_loaded
-    if _key_loaded:
+    if _key_loaded and SUPABASE_KEY:
         return
     _key_loaded = True
     SUPABASE_KEY = os.environ.get("ATHENA_SUPABASE_KEY", "")
     if not SUPABASE_KEY:
-        try:
-            from auth_client import get_api_key
-            SUPABASE_KEY = get_api_key("ATHENA_SUPABASE_KEY")
-        except Exception:
-            pass
+        from auth_client import get_api_key
+        SUPABASE_KEY = get_api_key("ATHENA_SUPABASE_KEY")
     if not SUPABASE_KEY:
-        SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlvY2lxdGhheHlzcXFxYW1vbnFhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjkwNDYzOTAsImV4cCI6MjA4NDYyMjM5MH0.9xD-bbEzN7Xv5npRjv5PuguQrBGZBiqTm8Cs2n8crOs"
-        logger.info("Using Athena Supabase anon key (fallback)")
+        raise RuntimeError(
+            "ATHENA_SUPABASE_KEY unavailable from auth-mcp — recon storage "
+            "is down until auth-mcp is reachable (no baked-in fallback).")
 
 
 def _headers():
@@ -55,13 +57,23 @@ def _headers():
 # ── Bond reference lookup (bond-data Supabase project) ─────────────────────
 
 BOND_DATA_URL = "https://xdgicslrdudsqlsudsgv.supabase.co"
-BOND_DATA_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhkZ2ljc2xyZHVkc3Fsc3Vkc2d2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM1NDc5NTMsImV4cCI6MjA4OTEyMzk1M30.Pn7MNCqJX_AolIoNclKd7Qu7ifCqTHdCZ-rnaeNpYZk"
+_bond_data_key = ""
 
 
 def _bond_data_headers():
+    global _bond_data_key
+    if not _bond_data_key:
+        _bond_data_key = os.environ.get("BOND_DATA_SUPABASE_KEY", "")
+    if not _bond_data_key:
+        from auth_client import get_api_key
+        _bond_data_key = get_api_key("BOND_DATA_SUPABASE_KEY")
+    if not _bond_data_key:
+        raise RuntimeError(
+            "BOND_DATA_SUPABASE_KEY unavailable from auth-mcp (no baked-in "
+            "fallback).")
     return {
-        "apikey": BOND_DATA_KEY,
-        "Authorization": f"Bearer {BOND_DATA_KEY}",
+        "apikey": _bond_data_key,
+        "Authorization": f"Bearer {_bond_data_key}",
     }
 
 
