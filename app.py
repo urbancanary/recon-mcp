@@ -295,6 +295,92 @@ async def upload_maia(
     return result
 
 
+# ── AUM reconciliation (fund-level, three-way Maia|GA10|administrator) ─────
+#
+# The recon that used to live inside Athena (/api/nav-comparison). Fund set
+# comes from funds.FUNDS; files come from Supabase Storage keyed by their
+# RESOLVED data date (see aum_orchestrator's module docstring).
+
+@app.get("/funds")
+async def list_funds():
+    import funds as _funds
+    return {"funds": [
+        {"id": pid, **{k: v for k, v in f.items() if k != "aliases"},
+         "aum": pid in _funds.aum_funds()}
+        for pid, f in _funds.FUNDS.items()
+    ]}
+
+
+@app.get("/aum/{fund}")
+async def aum_comparison(fund: str, date: str = None):
+    """Full three-way AUM comparison payload for a fund (see aum_orchestrator).
+
+    ``date`` pins the Maia side (YYYY-MM-DD); the administrator pack is then
+    date-matched to the Maia view actually used."""
+    import funds as _funds
+    import aum_orchestrator
+    pid = _funds.resolve(fund)
+    if not pid:
+        raise HTTPException(status_code=404, detail=f"unknown fund {fund}")
+    result = await aum_orchestrator.build_aum_comparison(pid, date)
+    if result.get("error"):
+        raise HTTPException(status_code=result.pop("status", 500),
+                            detail=result["error"])
+    return result
+
+
+@app.get("/aum/{fund}/dates")
+async def aum_dates(fund: str):
+    import funds as _funds
+    import aum_orchestrator
+    pid = _funds.resolve(fund)
+    if not pid:
+        raise HTTPException(status_code=404, detail=f"unknown fund {fund}")
+    return await aum_orchestrator.available_dates(pid)
+
+
+@app.post("/aum/upload/maia")
+async def aum_upload_maia(
+    file: UploadFile = File(...),
+    fund: str = "gdbf",
+    x_user_email: str = Header(None, alias="X-User-Email"),
+):
+    """Store a Maia export for the AUM recon, dated from its own contents.
+
+    Separate from the legacy /upload/maia (bond-level recon_maia rows for
+    wnbf/gcrif): this path validates shape (rejects 0-bond parses), resolves
+    the data date via _maia_as_of, and registers ISIN-bearing files as
+    bridge views too."""
+    import funds as _funds
+    import aum_orchestrator
+    pid = _funds.resolve(fund)
+    if not pid:
+        raise HTTPException(status_code=404, detail=f"unknown fund {fund}")
+    if not file.filename or not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Expected a .xlsx Maia export")
+    contents = await file.read()
+    if len(contents) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large (max 10MB)")
+    result = await aum_orchestrator.ingest_maia(
+        pid, contents, file.filename, x_user_email or "unknown")
+    if result.get("status") == "error":
+        raise HTTPException(status_code=422, detail=result.get("error"))
+    return result
+
+
+@app.get("/aum/{fund}/uploads")
+async def aum_uploads(fund: str):
+    """Upload history for the AUM recon sources (audit trail for the UI)."""
+    import funds as _funds
+    import recon_db
+    pid = _funds.resolve(fund)
+    if not pid:
+        raise HTTPException(status_code=404, detail=f"unknown fund {fund}")
+    rows = await recon_db.list_uploads(portfolio_id=pid)
+    keep = {"maia_aum", "maia_ref", "admin", "admin_payload"}
+    return {"uploads": [r for r in rows if r.get("source") in keep]}
+
+
 # ── Read endpoints ─────────────────────────────────────────────────────────
 
 @app.get("/recon/data")

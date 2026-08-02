@@ -29,9 +29,21 @@ from alerts import (
 
 logger = logging.getLogger(__name__)
 
-GA10_PRICING_URL = os.environ.get("GA10_PRICING_URL", "")
-if not GA10_PRICING_URL:
-    raise RuntimeError("Configuration missing")
+_ga10_pricing_url = ""
+
+
+def _ga10_pricing() -> str:
+    """GA10_PRICING_URL, lazily: env override → auth-mcp. Import-time raise
+    made the module unimportable anywhere without the Railway env var."""
+    global _ga10_pricing_url
+    if not _ga10_pricing_url:
+        _ga10_pricing_url = os.environ.get("GA10_PRICING_URL", "")
+    if not _ga10_pricing_url:
+        from auth_client import get_service_url
+        _ga10_pricing_url = get_service_url("GA10_PRICING_URL")
+    if not _ga10_pricing_url:
+        raise RuntimeError("GA10_PRICING_URL unavailable from auth-mcp")
+    return _ga10_pricing_url
 
 ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")
 MAIA_DATE_RE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$")
@@ -1293,6 +1305,11 @@ async def process_admin_upload(file_bytes: bytes, filename: str, uploaded_by: st
                 "mv": h.get("market_value"),
             })
 
+    # The FULL parsed payload (hedge_ledger, share classes, aum_breakdown)
+    # goes to storage too — recon_admin rows are bond-level only and cannot
+    # feed the fund-level AUM comparison (aum_orchestrator reads this JSON
+    # instead of re-parsing the .xls on every page view).
+    import aum_orchestrator
     await asyncio.gather(
         store_admin(admin_pid, admin_date, admin_bonds, uploaded_by),
         store_raw_upload(
@@ -1300,6 +1317,7 @@ async def process_admin_upload(file_bytes: bytes, filename: str, uploaded_by: st
             file_bytes=file_bytes, filename=filename,
             uploaded_by=uploaded_by, bonds_parsed=len(admin_bonds),
         ),
+        aum_orchestrator.ingest_admin_payload(admin_pid, result),
     )
 
     # Write admin prices to bond_analytics_dated (bond-data Supabase)

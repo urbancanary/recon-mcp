@@ -111,13 +111,28 @@ async def lookup_bond_reference(isins: list[str]) -> dict[str, dict]:
 # ── Sync: Orca holdings → orca_holdings table ────────────────────────────────
 # Recon views join orca_holdings for Athena Par (the actual holding, not BBG nominal).
 
-ORCA_MCP_URL = os.environ.get("ORCA_MCP_URL", "")
-if not ORCA_MCP_URL:
-    raise RuntimeError("Configuration missing")
+_orca_url = ""
+
+
+def _orca_mcp_url() -> str:
+    """ORCA_MCP_URL, lazily: env override → auth-mcp. The old import-time
+    `raise RuntimeError` made the whole module unimportable on any machine
+    without the Railway env var (tests, laptop, the box) — the exact
+    portability bug the auth-mcp rules exist for."""
+    global _orca_url
+    if not _orca_url:
+        _orca_url = os.environ.get("ORCA_MCP_URL", "")
+    if not _orca_url:
+        from auth_client import get_service_url
+        _orca_url = get_service_url("ORCA_MCP_URL")
+    if not _orca_url:
+        raise RuntimeError("ORCA_MCP_URL unavailable from auth-mcp")
+    return _orca_url
 
 
 async def sync_orca_holdings(portfolio_id: str = "wnbf") -> dict:
     """Fetch holdings from Orca and upsert into orca_holdings table."""
+    ORCA_MCP_URL = _orca_mcp_url()
     _ensure_key()
     try:
         async with httpx.AsyncClient(timeout=30) as client:
