@@ -151,7 +151,11 @@ def unauthorized(request: Request):
         base = login_url()
         if base:
             proto = request.headers.get("x-forwarded-proto", "https")
-            host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+            # X-Recon-Public-Host is set by the recon.x-trillion.com gateway
+            # worker; Railway's edge clobbers plain X-Forwarded-Host.
+            host = (request.headers.get("x-recon-public-host")
+                    or request.headers.get("x-forwarded-host")
+                    or request.headers.get("host", ""))
             return_to = f"{proto}://{host}{request.url.path}"
             from urllib.parse import quote
             return RedirectResponse(

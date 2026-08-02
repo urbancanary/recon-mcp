@@ -1,0 +1,14 @@
+# recon.x-trillion.com → recon-mcp (Railway) proxy.
+#
+# WHY THIS EXISTS: the xt_session login cookie is Domain=.x-trillion.com, so
+# browsers only send it to x-trillion hostnames — the bare Railway URL can
+# never authenticate a human. custom_domain=true makes Cloudflare auto-manage
+# the DNS record + TLS cert (same pattern as hopper.x-trillion.com in
+# ga10-pricing-mcp). Deploy: cd gateway && npx wrangler deploy
+name = "recon-gateway"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+routes = [
+  { pattern = "recon.x-trillion.com", custom_domain = true }
+]
