@@ -14,9 +14,10 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-ORCA_URL = os.environ.get("ORCA_URL", "")
-if not ORCA_URL:
-    raise RuntimeError("Configuration missing")
+# The one legitimate bootstrap hardcode: auth-mcp is reached through the
+# gateway, and you cannot fetch the URL registry without a URL. Matches
+# athena_html_v3/auth_client.py. Env var overrides for clone boxes.
+ORCA_URL = os.environ.get("ORCA_URL", "https://orca-gateway.x-trillion.com")
 _CACHE_TTL = 300  # 5 minutes
 _cache: dict[str, tuple[str, float]] = {}  # key -> (value, expiry)
 

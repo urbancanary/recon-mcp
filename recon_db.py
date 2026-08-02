@@ -810,7 +810,13 @@ async def _fetch_independent_athena_prices(isins: list[str], recon_date: str) ->
 
     ga10_url = os.environ.get("GA10_PRICING_URL", "")
     if not ga10_url:
-        raise RuntimeError("Configuration missing")
+        try:
+            from auth_client import get_service_url
+            ga10_url = get_service_url("GA10_PRICING_URL")
+        except Exception:
+            ga10_url = ""
+    if not ga10_url:
+        raise RuntimeError("GA10_PRICING_URL unavailable from auth-mcp")
 
     try:
         start = datetime.strptime(recon_date, "%Y-%m-%d")

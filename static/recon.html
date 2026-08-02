@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fund Reconciliation — x-trillion</title>
+<link rel="stylesheet" href="/ui/recon.css">
+</head>
+<body>
+<div class="topbar">
+    <h1>Fund Reconciliation</h1>
+    <select id="fund"></select>
+    <select id="datePair" title="Maia valuation date (admin pack is date-matched to it)"></select>
+    <button id="reload">Reload</button>
+    <span id="status"></span>
+    <span class="sub" style="margin-left:auto">Maia | Athena/GA10 | Administrator</span>
+</div>
+
+<div id="verdict"></div>
+<div id="dateWarning"></div>
+
+<div class="section"><h2>AUM components</h2><div id="aumTable"></div>
+    <div id="notes"></div><div id="sources" class="src"></div></div>
+
+<div class="section"><h2>Evidence report</h2><div id="evidence"></div></div>
+
+<div class="section"><h2>Difference attribution — par / price / FX</h2><div id="attribution"></div></div>
+
+<div class="section"><h2>Per-bond breaks</h2><div id="bonds" class="scroll"></div></div>
+
+<div class="grid2">
+    <div class="section"><h2>Prices</h2><div id="prices" class="scroll"></div></div>
+    <div class="section"><h2>Accrued</h2><div id="accrued" class="scroll"></div></div>
+</div>
+
+<div class="grid2">
+    <div class="section"><h2>FX rates</h2><div id="fx"></div></div>
+    <div class="section"><h2>Currency &amp; share-class hedging</h2><div id="currency" class="scroll"></div></div>
+</div>
+
+<div class="section"><h2>Uploads</h2>
+    <div class="grid2">
+        <div>
+            <div class="drop" id="dropMaia">Drop a <b>Maia export</b> (.xlsx) here or click to choose
+                <input type="file" id="fileMaia" accept=".xlsx" hidden></div>
+            <div id="maiaUpStatus"></div>
+        </div>
+        <div>
+            <div class="drop" id="dropAdmin">Drop an <b>administrator NAV pack</b> (.xls) here or click to choose
+                <input type="file" id="fileAdmin" accept=".xls,.xlsx" hidden></div>
+            <div id="adminUpStatus"></div>
+        </div>
+    </div>
+    <div id="uploadHistory" style="margin-top:14px"></div>
+</div>
+
+<script src="/ui/recon.js"></script>
+</body>
+</html>

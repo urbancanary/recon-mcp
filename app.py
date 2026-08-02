@@ -42,6 +42,31 @@ app = FastAPI(
 _startup_time = datetime.utcnow()
 _backfill_status: dict = {"coupon_maturity": None}
 
+# ── Static UI (the AUM recon app) ───────────────────────────────────────────
+# Same-origin vanilla HTML/JS, gated per-request below (the static mount
+# itself cannot run the session check, so /ui/ goes through a small handler).
+from pathlib import Path as _Path
+from fastapi.responses import FileResponse, RedirectResponse
+
+_STATIC_DIR = _Path(__file__).parent / "static"
+
+
+@app.get("/")
+async def root():
+    return RedirectResponse("/ui/recon.html", status_code=302)
+
+
+@app.get("/ui/{asset}")
+async def ui_asset(request: Request, asset: str):
+    from recon_auth import current_user, unauthorized
+    user = await current_user(request)
+    if not user:
+        return unauthorized(request)
+    p = (_STATIC_DIR / asset).resolve()
+    if not str(p).startswith(str(_STATIC_DIR.resolve())) or not p.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(p)
+
 
 async def _startup_backfill():
     """On startup, sync bond data from bond-data Supabase and backfill missing fields."""
@@ -151,10 +176,15 @@ async def brian_manifest():
         "tier": "engine",
         "sort_order": 3,
         "enabled": True,
-        "version_hash": "v1_20260405",
-        "summary": "Bond reconciliation — BBG, admin NAV, Maia holdings, and GA10 QuantLib calcs joined by ISIN.",
+        "version_hash": "v2_20260802",
+        "summary": "Fund reconciliation — three-way AUM (Maia | GA10 | administrator) with its own UI, plus bond-level BBG/admin/Maia/GA10 recon joined by ISIN.",
         "base_url": "https://recon-mcp-production.up.railway.app",
         "capabilities": [
+            {
+                "name": "AUM reconciliation",
+                "description": "Three-way fund-level NAV comparison (Maia | Athena/GA10 | administrator) with materiality verdict, par/price/FX attribution, per-bond breaks, deterministic evidence report and currency-hedge section. Fund set from the registry; files keyed by resolved data date.",
+                "examples": ["GET /aum/gdbf", "GET /aum/gdbf/dates", "POST /aum/upload/maia?fund=gdbf"],
+            },
             {
                 "name": "Reconciliation data",
                 "description": "Get joined recon data for a portfolio/date. Returns BBG, admin, Maia, and GA10 data with derived diffs computed in the database.",
@@ -167,7 +197,8 @@ async def brian_manifest():
             },
         ],
         "pages": [
-            {"id": "main", "name": "Main", "path": "/", "description": "Recon service root."}
+            {"id": "recon-ui", "name": "Fund Reconciliation", "path": "/ui/recon.html",
+             "description": "The AUM reconciliation app: verdict, components, evidence report, attribution, per-bond breaks, uploads."}
         ],
         "tour": [],
     }
@@ -301,8 +332,20 @@ async def upload_maia(
 # comes from funds.FUNDS; files come from Supabase Storage keyed by their
 # RESOLVED data date (see aum_orchestrator's module docstring).
 
+async def _aum_gate(request: Request):
+    """Session / service-key / box-noauth gate for the AUM surface only —
+    the pre-existing machine endpoints keep their current open behaviour
+    (see recon_auth's module docstring)."""
+    from recon_auth import current_user, unauthorized
+    user = await current_user(request)
+    return None if user else unauthorized(request)
+
+
 @app.get("/funds")
-async def list_funds():
+async def list_funds(request: Request):
+    denied = await _aum_gate(request)
+    if denied:
+        return denied
     import funds as _funds
     return {"funds": [
         {"id": pid, **{k: v for k, v in f.items() if k != "aliases"},
@@ -312,11 +355,14 @@ async def list_funds():
 
 
 @app.get("/aum/{fund}")
-async def aum_comparison(fund: str, date: str = None):
+async def aum_comparison(request: Request, fund: str, date: str = None):
     """Full three-way AUM comparison payload for a fund (see aum_orchestrator).
 
     ``date`` pins the Maia side (YYYY-MM-DD); the administrator pack is then
     date-matched to the Maia view actually used."""
+    denied = await _aum_gate(request)
+    if denied:
+        return denied
     import funds as _funds
     import aum_orchestrator
     pid = _funds.resolve(fund)
@@ -330,7 +376,10 @@ async def aum_comparison(fund: str, date: str = None):
 
 
 @app.get("/aum/{fund}/dates")
-async def aum_dates(fund: str):
+async def aum_dates(request: Request, fund: str):
+    denied = await _aum_gate(request)
+    if denied:
+        return denied
     import funds as _funds
     import aum_orchestrator
     pid = _funds.resolve(fund)
@@ -341,6 +390,7 @@ async def aum_dates(fund: str):
 
 @app.post("/aum/upload/maia")
 async def aum_upload_maia(
+    request: Request,
     file: UploadFile = File(...),
     fund: str = "gdbf",
     x_user_email: str = Header(None, alias="X-User-Email"),
@@ -351,6 +401,9 @@ async def aum_upload_maia(
     wnbf/gcrif): this path validates shape (rejects 0-bond parses), resolves
     the data date via _maia_as_of, and registers ISIN-bearing files as
     bridge views too."""
+    denied = await _aum_gate(request)
+    if denied:
+        return denied
     import funds as _funds
     import aum_orchestrator
     pid = _funds.resolve(fund)
@@ -369,8 +422,11 @@ async def aum_upload_maia(
 
 
 @app.get("/aum/{fund}/uploads")
-async def aum_uploads(fund: str):
+async def aum_uploads(request: Request, fund: str):
     """Upload history for the AUM recon sources (audit trail for the UI)."""
+    denied = await _aum_gate(request)
+    if denied:
+        return denied
     import funds as _funds
     import recon_db
     pid = _funds.resolve(fund)

@@ -1,6 +1,3 @@
-# CANONICAL SOURCE: athena_html_v3/fund_config.py @ 0600e07 (2026-08-02).
-# This is a SYNCED COPY — do not fork. Edit the athena copy and re-copy;
-# scripts/check_parser_sync.py fails the promote checklist on drift.
 """
 Per-fund static configuration — currently the VALUATION POINT.
 
