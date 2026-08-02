@@ -313,6 +313,7 @@ def maia_breakdown(path: str) -> dict:
                   "fields": sorted(cols.index), "missing": sorted(cols.missing)},
         "capabilities": {"accrued": has_accrued, "forward_pnl": has_fwd_pnl,
                          "isin": cols.has("isin"), "price": cols.has("last_px")},
+        "forwards_unreliable": forwards_unreliable,
         # Top-level so consumers that never look at capabilities still see it.
         "forwards_unreliable": forwards_unreliable,
         "bonds_dirty": round(dirty, 2),
