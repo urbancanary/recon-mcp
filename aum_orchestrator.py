@@ -422,4 +422,189 @@ async def build_aum_comparison(pid: str, date: str | None = None) -> dict:
         logger.warning("aum: currency section failed: %s", e)
         result["currency"] = {"error": str(e)}
 
+    # ── FX-FORWARD ATTRIBUTION ALERT (compliance-facing). Share-class hedge
+    # forwards are fund assets but NOT fund currency positioning: a
+    # compliance test that counts them sees phantom exposure. Measured
+    # 31-Jul: GBP is -0.21% of NAV at fund level but +48.02% all-in — any
+    # limit check on the all-in number false-alarms (or worse, a real
+    # breach reads as hedged). Flag every currency where the two measures
+    # diverge by more than 5 points.
+    result["fx_forward_alert"] = _fx_forward_alert(result.get("currency"))
+
+    # ── COMPLIANCE REPORT PRESENCE. Maia's pre-trade compliance dump
+    # (maia_ptc) arrives via the OneDrive intake. Absence for the report
+    # date must be VISIBLE — "no compliance file was supplied for this
+    # date" is a finding the reader decides about, never a blank.
+    ptc = await _registry(pid, "maia_ptc")
+    ptc_dates = sorted({r.get("date") for r in ptc if r.get("date")}, reverse=True)
+    rep_date = parsed.get("valuation_date")
+    result["compliance_file"] = {
+        "supplied_for_date": rep_date in ptc_dates,
+        "report_date": rep_date,
+        "latest_on_file": ptc_dates[0] if ptc_dates else None,
+    }
+
+    # ── MANAGEMENT ASSESSMENT — the punchy, honest headline. Never says
+    # "agrees" while differences exist: every dollar of the stated gap is
+    # assigned to a named cause with a status, and the constant-price rerun
+    # (both books at the administrator's own marks) states what remains
+    # once time-of-day pricing is stripped out.
+    result["assessment"] = _build_assessment(result, maia_breakdown, parsed)
+
     return result
+
+
+def _fx_forward_alert(currency: dict | None, threshold_pts: float = 5.0) -> dict:
+    fe = (currency or {}).get("fund_exposure") or {}
+    rows = fe.get("rows") or []
+    base = fe.get("base_currency")
+    flagged = []
+    for r in rows:
+        if r.get("currency") == base:
+            continue  # base ccy is the mirror of the others — always moves
+        pf, pa = r.get("pct_nav_fund"), r.get("pct_nav_all")
+        if pf is None or pa is None:
+            continue
+        if abs(pa - pf) > threshold_pts:
+            flagged.append({
+                "currency": r.get("currency"),
+                "pct_nav_fund": pf,
+                "pct_nav_all_in": pa,
+                "distortion_pts": round(pa - pf, 2),
+                "share_class_forward_base": r.get("share_class_forward_base"),
+            })
+    return {
+        "alert": bool(flagged),
+        "threshold_pts": threshold_pts,
+        "currencies": flagged,
+        "message": (
+            "Share-class hedge forwards distort all-in currency exposure by "
+            "more than {:.0f} points in {} — currency compliance tests MUST "
+            "exclude share-class forwards (they hedge investors' classes, "
+            "not the fund's positioning), or alerts will fire on phantom "
+            "exposure.".format(threshold_pts,
+                               ", ".join(f["currency"] for f in flagged))
+            if flagged else
+            "Share-class forwards do not materially distort fund currency "
+            "exposure at this valuation."),
+    }
+
+
+def _build_assessment(result: dict, maia_breakdown: dict | None,
+                      parsed: dict) -> dict:
+    """Regroup the component differences into NAMED CAUSES that sum exactly
+    to the stated gap, plus the constant-price view. Numbers only from
+    figures already computed on this payload — nothing re-derived."""
+    if maia_breakdown is None:
+        return {"available": False,
+                "reason": "no usable Maia view — nothing to assess"}
+    integ = result.get("integrity") or {}
+    stated = integ.get("difference")
+    if stated is None:
+        return {"available": False, "reason": "totals unavailable"}
+
+    rows = {r["key"]: r for r in (result.get("rows") or [])}
+
+    def _mw(key):
+        r = rows.get(key) or {}
+        v = r.get("diff_maia_waystone")
+        if v is not None:
+            return v
+        # Maia has no figure for this component (e.g. other_net — no
+        # receivables concept). Its CONTRIBUTION to the stated gap is still
+        # real: Maia total omits what the admin includes, so the effect is
+        # minus the admin's value. Assigning it here keeps it out of
+        # "Unexplained", where an understood definitional gap doesn't belong.
+        w = r.get("waystone")
+        return -w if (r.get("maia") is None and w is not None) else 0.0
+
+    attrib = result.get("attribution") or {}
+    at = attrib.get("totals") or {}
+    price_eff = at.get("price") if attrib.get("available") else None
+    fx_eff = at.get("fx") if attrib.get("available") else None
+    par_eff = at.get("par") if attrib.get("available") else None
+    clean_diff = _mw("clean_bond_mv")
+
+    causes = []
+
+    def cause(name, amount, status, action):
+        causes.append({"cause": name, "amount": round(amount, 2),
+                       "status": status, "action": action})
+
+    detail = None
+    if price_eff is not None and fx_eff is not None:
+        detail = (f"price marks {price_eff:+,.2f}, FX rates {fx_eff:+,.2f}, "
+                  f"quantities {par_eff:+,.2f} (constant-par decomposition)")
+    cause("Pricing timing — clean bond value", clean_diff,
+          "known_cause",
+          "Maia snapshots intraday vs the administrator's 12:00 strike. "
+          + (detail or "Per-bond decomposition needs an ISIN view.")
+          + " Conclusive fix: rerun both books on ONE price source.")
+    cause("Accrual measurement", _mw("accrued_income"),
+          "question_open",
+          "Maia's price-implied accrual runs ahead of the administrator's "
+          "booked accrual (more accrued days on every line). Confirm the "
+          "day-count basis with the front office.")
+    fwd = _mw("fx_forward_pnl_fund") + _mw("fx_forward_pnl_share_class")
+    cause("Forward P&L owner attribution", fwd,
+          "question_open",
+          "The fund/share-class rows offset — largely the same forwards "
+          "attributed to different owners. Confirm Maia's owner mapping "
+          "against OpenCurrency's per-block totals.")
+    cause("Cash definition", _mw("cash"),
+          "definitional",
+          "Maia's cash includes unsettled forward legs; the administrator's "
+          "does not. Not like-for-like by construction.")
+    cause("Receivables/payables", _mw("other_net"),
+          "definitional",
+          "Administrator-only concept (Balance Sheet); Maia has no "
+          "equivalent line.")
+    residual = stated - sum(c["amount"] for c in causes)
+    if abs(residual) >= 0.01:
+        cause("Unexplained", residual, "investigate",
+              "Not attributable to any identified cause — investigate "
+              "before signing off.")
+
+    # Constant-price rerun: strip the marks (price+FX at constant par) and
+    # state what remains — the differences a single price source would NOT
+    # remove.
+    constant_price = None
+    if price_eff is not None and fx_eff is not None:
+        remaining = stated - price_eff - fx_eff
+        constant_price = {
+            "basis": "both books at the administrator's prices and FX, "
+                     "constant par",
+            "pricing_timing_removed": round(price_eff + fx_eff, 2),
+            "remaining_difference": round(remaining, 2),
+            "remaining_pct": round(remaining / integ["admin_nav"] * 100, 3)
+            if integ.get("admin_nav") else None,
+        }
+
+    unexplained = sum(c["amount"] for c in causes
+                      if c["status"] == "investigate")
+    open_q = sum(abs(c["amount"]) for c in causes
+                 if c["status"] == "question_open")
+    level = ("material_unexplained" if abs(stated) > 0 and integ.get("material")
+             else "investigate" if abs(unexplained) >= 0.01
+             else "explained_not_identical" if abs(stated) >= 0.01
+             else "identical")
+    headline = {
+        "identical": "The two systems state the same total.",
+        "explained_not_identical":
+            "NOT identical: the front office is {:,.2f} ({:+.2f}%) {} the "
+            "administrator. Every dollar of the gap is assigned to a named "
+            "cause below; {:,.2f} sits in causes still awaiting confirmation."
+            .format(abs(stated), integ.get("difference_pct") or 0,
+                    "below" if stated < 0 else "above", open_q),
+        "investigate":
+            "NOT identical, with an UNEXPLAINED residual — see the cause "
+            "table before relying on either figure.",
+        "material_unexplained":
+            "MATERIAL difference of {:,.2f} ({:+.2f}%). The administrator's "
+            "valuation should be used until this is resolved."
+            .format(abs(stated), integ.get("difference_pct") or 0),
+    }[level]
+    return {"available": True, "level": level, "headline": headline,
+            "stated_difference": stated,
+            "stated_pct": integ.get("difference_pct"),
+            "causes": causes, "constant_price": constant_price}

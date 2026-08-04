@@ -53,12 +53,19 @@ def test_aum_endpoint_full_payload(client):
     assert r.status_code == 200
     body = r.json()
     for key in ("rows", "total", "notes", "integrity", "attribution",
-                "evidence_report", "prices", "currency", "meta"):
+                "evidence_report", "prices", "currency", "meta",
+                "assessment", "compliance_file", "fx_forward_alert"):
         assert key in body, key
     assert body["meta"]["dates_match"] is True
     # Fixture book agrees to the cent → not material.
     assert body["integrity"]["material"] is False
     assert body["attribution"]["available"] is True
+    # Assessment: causes must sum exactly to the stated difference.
+    a = body["assessment"]
+    assert a["available"] is True
+    assert abs(sum(c["amount"] for c in a["causes"]) - a["stated_difference"]) < 0.01
+    # No compliance file in the fixture registry → flagged, never silent.
+    assert body["compliance_file"]["supplied_for_date"] is False
 
 
 def test_alias_resolution(client):

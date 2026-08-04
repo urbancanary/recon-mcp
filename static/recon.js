@@ -39,14 +39,74 @@
     }
 
     // ── sections ────────────────────────────────────────────────────────
+    // Management summary — never "AGREES" while a difference exists. The
+    // headline states the gap; the cause ladder assigns every dollar of it;
+    // the constant-price line says what a single price source would leave.
+    const CAUSE_BADGE = {
+        known_cause: ['known cause', ''],
+        question_open: ['awaiting confirmation', 'indicated'],
+        definitional: ['definitional', ''],
+        investigate: ['INVESTIGATE', 'fail'],
+    };
+    const LEVEL_STYLE = {
+        identical: 'ok', explained_not_identical: 'warn',
+        investigate: 'bad', material_unexplained: 'bad',
+    };
+    const LEVEL_LABEL = {
+        identical: 'IDENTICAL',
+        explained_not_identical: 'NOT IDENTICAL — DIFFERENCES EXPLAINED',
+        investigate: 'NOT IDENTICAL — UNEXPLAINED RESIDUAL',
+        material_unexplained: 'MATERIAL DIFFERENCE',
+    };
+
     function renderVerdict(r) {
+        const a = r.assessment;
         const i = r.integrity;
-        if (!i) { $('verdict').innerHTML = ''; return; }
-        $('verdict').innerHTML = `<div class="banner ${i.material ? 'bad' : 'ok'}">
-            <b>${i.material ? 'MATERIAL DIFFERENCE' : 'AGREES'}</b> —
-            Maia ${num(i.maia_total)} vs administrator ${num(i.admin_nav)}:
-            ${num(i.difference)} (${i.difference_pct > 0 ? '+' : ''}${i.difference_pct}%).
-            <div style="font-size:12.5px;margin-top:4px;opacity:.9">${esc(i.verdict)}</div></div>`;
+        if (!a || !a.available) {
+            $('verdict').innerHTML = i ? `<div class="banner ${i.material ? 'bad' : 'warn'}">
+                ${esc(i.verdict)}</div>` : '';
+            return;
+        }
+        const ladder = (a.causes || []).map(c => {
+            const [label, cls] = CAUSE_BADGE[c.status] || [c.status, ''];
+            return `<tr><td class="lbl">${esc(c.cause)}
+                <span class="badge ${cls}">${label}</span></td>
+                ${diffCell(c.amount, c.status === 'definitional')}
+                <td style="text-align:left;color:var(--text-muted);font-size:12px;
+                           max-width:640px">${esc(c.action)}</td></tr>`;
+        }).join('');
+        const cp = a.constant_price;
+        const chips = [];
+        const cf = r.compliance_file || {};
+        if (cf.report_date) {
+            chips.push(cf.supplied_for_date
+                ? `<span class="badge pass">compliance report supplied for ${esc(cf.report_date)}</span>`
+                : `<span class="badge fail">compliance report NOT SUPPLIED for ${esc(cf.report_date)}`
+                  + (cf.latest_on_file ? ` — latest on file ${esc(cf.latest_on_file)}` : '')
+                  + `</span>`);
+        }
+        const fx = r.fx_forward_alert || {};
+        if (fx.alert) {
+            chips.push(`<span class="badge fail">share-class FX forwards distort `
+                + fx.currencies.map(c => `${esc(c.currency)} ${c.pct_nav_fund}%→${c.pct_nav_all_in}%`).join(', ')
+                + `</span>`);
+        }
+        $('verdict').innerHTML = `<div class="banner ${LEVEL_STYLE[a.level] || 'warn'}">
+            <b>${LEVEL_LABEL[a.level] || a.level}</b> —
+            front office ${num((i || {}).maia_total)} vs administrator ${num((i || {}).admin_nav)}
+            = <b>${num(a.stated_difference)}</b> (${a.stated_pct > 0 ? '+' : ''}${a.stated_pct}%)
+            <div style="font-size:13px;margin:6px 0 10px;opacity:.95">${esc(a.headline)}</div>
+            <table style="margin-bottom:8px"><thead><tr><th>Cause</th><th>Amount</th>
+                <th style="text-align:left">What it means / next action</th></tr></thead>
+                <tbody>${ladder}</tbody></table>
+            ${cp ? `<div style="font-size:12.5px;color:var(--text-secondary)">
+                <b>Constant-price rerun</b> (${esc(cp.basis)}): pricing timing accounts for
+                ${num(cp.pricing_timing_removed)}; the difference a single price source would
+                NOT remove is <b>${num(cp.remaining_difference)}</b>
+                (${cp.remaining_pct > 0 ? '+' : ''}${cp.remaining_pct}% of NAV).</div>` : ''}
+            ${chips.length ? `<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+                ${chips.join('')}</div>` : ''}
+        </div>`;
     }
 
     function renderDateWarning(r) {
@@ -224,21 +284,43 @@
             $('currency').innerHTML = `<div class="muted">${esc((c || {}).error || 'unavailable')}</div>`;
             return;
         }
-        const exp = (c.exposure || c.rows || []).map(x => `<tr>
-            <td class="lbl">${esc(x.currency || x.ccy || '')}</td>
-            <td>${num(x.exposure ?? x.exposure_base)}</td>
-            <td>${num(x.hedge ?? x.hedge_notional)}</td>
-            <td>${x.coverage_pct == null ? DASH : num(x.coverage_pct, 1) + '%'}</td></tr>`).join('');
-        const cls = (c.share_classes || []).map(x => `<tr>
-            <td class="lbl">${esc(x.share_class || x.name || '')}</td>
-            <td>${num(x.hedge_pl ?? x.pl)}</td>
-            <td>${x.per_share == null ? DASH : num(x.per_share, 5)}</td></tr>`).join('');
+        const fe = c.fund_exposure || {};
+        const base = fe.base_currency;
+        const fx = r.fx_forward_alert || {};
+        const flaggedCcy = new Set((fx.currencies || []).map(x => x.currency));
+        const exp = (fe.rows || []).map(x => {
+            const hot = flaggedCcy.has(x.currency);
+            return `<tr${hot ? ' style="background:rgba(255,107,107,.06)"' : ''}>
+                <td class="lbl">${esc(x.currency)}${x.currency === base
+                    ? ' <span class="badge">base</span>' : ''}</td>
+                <td>${num(x.bonds_base)}</td>
+                <td>${num(x.fund_forward_base)}</td>
+                <td>${num(x.share_class_forward_base)}</td>
+                <td>${num(x.net_fund_base)}</td>
+                <td>${x.pct_nav_fund == null ? DASH : num(x.pct_nav_fund, 2) + '%'}</td>
+                <td class="${hot ? 'num-neg' : ''}">${x.pct_nav_all == null ? DASH
+                    : num(x.pct_nav_all, 2) + '%'}</td></tr>`;
+        }).join('');
+        const sc = c.share_class_hedges || {};
+        const cls = (sc.rows || []).map(x => `<tr>
+            <td class="lbl">${esc(x.share_class)}</td>
+            <td>${esc(x.currency)}</td>
+            <td>${num(x.net_assets_local, 0)}</td>
+            <td>${num(x.hedge_notional_local, 0)}</td>
+            <td>${x.pct_hedged == null ? DASH : num(x.pct_hedged, 2) + '%'}</td>
+            <td>${x.within_tolerance
+                ? '<span class="badge pass">ok</span>'
+                : '<span class="badge fail">outlier</span>'}</td></tr>`).join('');
         $('currency').innerHTML =
-            (exp ? `<table style="margin-bottom:10px"><thead><tr><th>Ccy</th><th>Exposure</th>
-                <th>Hedge</th><th>Coverage</th></tr></thead><tbody>${exp}</tbody></table>` : '')
-            + (cls ? `<table><thead><tr><th>Share class</th><th>Hedge P&amp;L</th>
-                <th>Per share</th></tr></thead><tbody>${cls}</tbody></table>` : '')
-            + (!exp && !cls ? `<pre class="muted" style="white-space:pre-wrap">${esc(JSON.stringify(c, null, 1))}</pre>` : '');
+            (fx.alert ? `<div class="note err">&#9888; ${esc(fx.message)}</div>` : '')
+            + (exp ? `<table style="margin-bottom:12px"><thead><tr><th>Ccy</th>
+                <th>Bonds</th><th>Fund fwd</th><th>Share-class fwd</th>
+                <th>Net (fund)</th><th>%NAV fund</th><th>%NAV all-in</th></tr></thead>
+                <tbody>${exp}</tbody></table>` : '')
+            + (cls ? `<table><thead><tr><th>Share class</th><th>Ccy</th>
+                <th>Net assets (local)</th><th>Hedge notional</th><th>Hedged</th>
+                <th></th></tr></thead><tbody>${cls}</tbody></table>` : '')
+            + (!exp && !cls ? '<div class="muted">no currency data</div>' : '');
     }
 
     async function renderUploadHistory() {
@@ -315,17 +397,26 @@
         state.date = $('datePair').value || null;
     }
 
+    // Monotonic load sequence: a slow earlier request must never overwrite a
+    // newer selection (the unpinned initial load once outlived a date-pinned
+    // one and silently rendered the wrong pair — worst kind of wrong for a
+    // recon page, where the numbers all LOOK plausible).
+    let _loadSeq = 0;
+
     async function load() {
+        const seq = ++_loadSeq;
         $('status').textContent = 'loading…';
         try {
             const url = `/aum/${state.fund}` + (state.date ? `?date=${state.date}` : '');
             const r = await jget(url);
+            if (seq !== _loadSeq) return; // superseded by a newer selection
             renderVerdict(r); renderDateWarning(r); renderAum(r); renderEvidence(r);
             renderAttribution(r); renderBonds(r); renderPrices(r); renderAccrued(r);
             renderFx(r); renderCurrency(r);
             $('status').textContent = '';
             renderUploadHistory();
         } catch (e) {
+            if (seq !== _loadSeq) return;
             $('status').innerHTML = `<span class="err">${esc(e.message)}</span>`;
         }
     }
