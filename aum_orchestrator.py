@@ -146,14 +146,67 @@ async def ingest_admin_payload(pid: str, parsed: dict) -> str:
 _GAE_URL = "https://future-footing-414610.uc.r.appspot.com"  # same as recon_engine
 
 
+async def _ga10_batch(prices: dict, settle_iso: str, api_key: str) -> dict:
+    """One GA10 GAE portfolio/analysis call → {isin: bond_data row}.
+
+    RESILIENT TO POISON BONDS: the GAE batch dies wholesale ('NoneType is
+    not iterable') when ANY bond lacks reference data — 7 GDBF corps did
+    exactly that and blanked all 28 marks. On failure the batch splits in
+    half recursively, so every priceable bond still gets a mark and only
+    the genuinely un-enrolled ones drop out.
+    """
+    if not prices:
+        return {}
+    inv_date = settle_iso.replace("-", "/")
+    payload = {"format": "FLDS", "data": [
+        {"BOND_CD": i, "CLOSING PRICE": float(p), "WEIGHTING": 1.0,
+         "Inventory Date": inv_date} for i, p in prices.items()]}
+    async def _post():
+        async with httpx.AsyncClient(timeout=120.0) as c:
+            return await c.post(f"{_GAE_URL}/api/v1/portfolio/analysis",
+                                json=payload,
+                                headers={"Content-Type": "application/json",
+                                         "X-API-Key": api_key})
+    try:
+        r = await _post()
+        if r.status_code >= 500 and len(prices) == 1:
+            # A lone bond's failure may be transient GAE load rather than
+            # missing reference data — one retry before writing it off.
+            await asyncio.sleep(1.0)
+            r = await _post()
+    except Exception as e:
+        logger.warning("GA10 batch failed (%d bonds): %s", len(prices), e)
+        return {}
+    if r.status_code == 200:
+        return {b["isin"]: b for b in (r.json().get("bond_data") or [])
+                if b.get("isin")}
+    if len(prices) == 1:
+        logger.info("GA10 cannot price %s (not enrolled?)", next(iter(prices)))
+        return {}
+    # SEQUENTIAL halves, not gather(): the recursive fan-out in parallel
+    # (× two settle dates) overloaded GAE and flaked good bonds — coverage
+    # dropped from 21 to 11 of 28. Slower but complete beats fast but wrong.
+    items = list(prices.items())
+    mid = len(items) // 2
+    left = await _ga10_batch(dict(items[:mid]), settle_iso, api_key)
+    right = await _ga10_batch(dict(items[mid:]), settle_iso, api_key)
+    return {**left, **right}
+
+
 async def _ga10_marks(holdings: list[dict], settle_iso: str) -> dict:
-    """{isin: {clean_price, accrued_per_100, coupon, analytics_source}} from a
-    single GA10 GAE portfolio/analysis batch at the admin's own prices.
+    """{isin: {clean_price, accrued_per_100, accrued_per_100_c1, ...}} from
+    GA10 at the admin's own prices, at TWO settlement dates:
+
+      T+0  the valuation date itself
+      C+1  calendar day after — the accrual point that matches Waystone's
+           market-settlement convention on the funds measured so far (the
+           recon views show C+1 only for the same reason).
 
     GA10's accrued is an INDEPENDENT calculation, not a restatement of the
     administrator's — which is what makes the accrued comparison genuinely
     three-way. Best-effort: any failure returns {} and the page says so.
     """
+    from datetime import datetime, timedelta
     from auth_client import get_api_key
     prices = {h["isin"]: h.get("price") for h in holdings
               if h.get("isin") and h.get("price")}
@@ -162,36 +215,27 @@ async def _ga10_marks(holdings: list[dict], settle_iso: str) -> dict:
     api_key = get_api_key("GA10_API_KEY", requester="recon-mcp-aum")
     if not api_key:
         return {}
-    inv_date = settle_iso.replace("-", "/")
-    payload = {"format": "FLDS", "data": [
-        {"BOND_CD": i, "CLOSING PRICE": float(p), "WEIGHTING": 1.0,
-         "Inventory Date": inv_date} for i, p in prices.items()]}
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as c:
-            r = await c.post(f"{_GAE_URL}/api/v1/portfolio/analysis",
-                             json=payload,
-                             headers={"Content-Type": "application/json",
-                                      "X-API-Key": api_key})
-        if r.status_code != 200:
-            logger.warning("GA10 marks: HTTP %s %s", r.status_code, r.text[:200])
-            return {}
-        out = {}
-        for b in (r.json().get("bond_data") or []):
-            isin = b.get("isin")
-            if not isin:
-                continue
-            out[isin] = {
-                "clean_price": prices.get(isin),
-                "accrued_per_100": b.get("accrued_interest"),
-                "ytw": b.get("yield") or b.get("ytm"),
-                "duration": b.get("duration"),
-                "coupon": b.get("coupon"),
-                "analytics_source": "GA10",
-            }
-        return out
-    except Exception as e:
-        logger.warning("GA10 marks unavailable: %s", e)
-        return {}
+    c1 = (datetime.strptime(settle_iso, "%Y-%m-%d")
+          + timedelta(days=1)).strftime("%Y-%m-%d")
+    # Sequential, same reason as the sequential halves in _ga10_batch.
+    t0_map = await _ga10_batch(prices, settle_iso, api_key)
+    c1_map = await _ga10_batch(prices, c1, api_key)
+    out = {}
+    for isin in prices:
+        t0, c1b = t0_map.get(isin), c1_map.get(isin)
+        if not t0 and not c1b:
+            continue
+        b = t0 or c1b
+        out[isin] = {
+            "clean_price": prices.get(isin),
+            "accrued_per_100": (t0 or {}).get("accrued_interest"),
+            "accrued_per_100_c1": (c1b or {}).get("accrued_interest"),
+            "ytw": b.get("yield") or b.get("ytm"),
+            "duration": b.get("duration"),
+            "coupon": b.get("coupon"),
+            "analytics_source": "GA10",
+        }
+    return out
 
 
 # ── Date inventory ──────────────────────────────────────────────────────────
@@ -444,6 +488,14 @@ async def build_aum_comparison(pid: str, date: str | None = None) -> dict:
         "latest_on_file": ptc_dates[0] if ptc_dates else None,
     }
 
+    # ── THREE-WAY ACCRUED RECON (Waystone | Maia | GA10). Compared per-100
+    # of par in LOCAL currency so FX drops out entirely. GA10 shows both
+    # T+0 and C+1 accrual points — Waystone accrues to market settlement,
+    # so its figure should sit on C+1, not T+0; agreement there and a gap
+    # at T+0 is the convention, not a break.
+    result["accrued_recon"] = _accrued_recon(
+        parsed, maia_rows_bonds, result.get("athena_marks") or {})
+
     # ── MANAGEMENT ASSESSMENT — the punchy, honest headline. Never says
     # "agrees" while differences exist: every dollar of the stated gap is
     # assigned to a named cause with a status, and the constant-price rerun
@@ -487,6 +539,68 @@ def _fx_forward_alert(currency: dict | None, threshold_pts: float = 5.0) -> dict
             if flagged else
             "Share-class forwards do not materially distort fund currency "
             "exposure at this valuation."),
+    }
+
+
+def _accrued_recon(parsed: dict, maia_bond_rows: list[dict],
+                   athena_marks: dict) -> dict:
+    """Per-bond accrued from all three sources, normalised to per-100 of par
+    in the bond's OWN currency:
+
+        Waystone   accrued_income is BASE ccy → /fx /par ×100
+        Maia       accrued is LOCAL ccy       → /qty ×100
+        GA10       accrued_interest is already per-100 (T+0 and C+1)
+
+    Rows carry the raw diffs; verdicts stay with the reader (and the
+    assessment) — this table is evidence, not opinion.
+    """
+    fx = {"USD": 1.0}
+    rates = (parsed.get("fx_rates") or {}).get("rates") or {}
+    for c, r in rates.items():
+        if r:
+            fx[c] = 1.0 / r  # parser stores units-per-base; we need base-per-unit
+    base = parsed.get("base_currency") or "USD"
+    fx.setdefault(base, 1.0)
+    maia_by_isin = {r["isin"]: r for r in (maia_bond_rows or []) if r.get("isin")}
+
+    rows, ga10_missing = [], []
+    for h in parsed.get("holdings") or []:
+        isin, par = h.get("isin"), h.get("par_amount") or h.get("face_value")
+        if not isin or not par:
+            continue
+        ccy = h.get("currency") or base
+        f = fx.get(ccy)
+        w100 = None
+        acc_base = h.get("accrued_income")
+        if acc_base is not None and f:
+            w100 = acc_base / f / par * 100
+        m = maia_by_isin.get(isin) or {}
+        m100 = None
+        if m.get("accrued") is not None and m.get("qty"):
+            m100 = m["accrued"] / m["qty"] * 100
+        g = athena_marks.get(isin) or {}
+        g_t0, g_c1 = g.get("accrued_per_100"), g.get("accrued_per_100_c1")
+        if not g:
+            ga10_missing.append(isin)
+        rows.append({
+            "isin": isin, "description": h.get("description"),
+            "currency": ccy, "par": par, "coupon": h.get("coupon"),
+            "waystone_per100": round(w100, 4) if w100 is not None else None,
+            "maia_per100": round(m100, 4) if m100 is not None else None,
+            "ga10_t0_per100": round(g_t0, 4) if g_t0 is not None else None,
+            "ga10_c1_per100": round(g_c1, 4) if g_c1 is not None else None,
+            "diff_maia_waystone": round(m100 - w100, 4)
+            if (m100 is not None and w100 is not None) else None,
+            "diff_ga10c1_waystone": round(g_c1 - w100, 4)
+            if (g_c1 is not None and w100 is not None) else None,
+        })
+    return {
+        "basis": "accrued per 100 of par, local currency (FX-independent). "
+                 "Waystone accrues to MARKET SETTLEMENT — compare it against "
+                 "GA10's C+1 column; the T+0 column is the trade-date accrual.",
+        "rows": rows,
+        "ga10_missing": ga10_missing,
+        "ga10_coverage": f"{len(rows) - len(ga10_missing)}/{len(rows)}",
     }
 
 

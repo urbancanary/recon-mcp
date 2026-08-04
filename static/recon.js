@@ -247,20 +247,34 @@
     }
 
     function renderAccrued(r) {
-        const marks = r.athena_marks || {};
-        const b = r.bonds;
-        const rows = ((b && b.rows) || []).map(x => {
-            const ga = marks[x.isin] || {};
-            return `<tr><td class="lbl">${esc(x.isin)}</td>
-                <td>${num(x.admin_accrued_base)}</td>
-                <td>${num(ga.accrued_per_100, 4)}</td></tr>`;
+        const ar = r.accrued_recon;
+        if (!ar || !(ar.rows || []).length) {
+            $('accrued').innerHTML = '<div class="muted">no accrued data</div>';
+            return;
+        }
+        const rows = ar.rows.map(x => {
+            const dmw = x.diff_maia_waystone;
+            const dgc = x.diff_ga10c1_waystone;
+            return `<tr><td class="lbl">${esc(x.isin)}
+                    <span class="muted">${esc(x.currency)}${x.coupon != null
+                        ? ' ' + num(x.coupon, 3) + '%' : ''}</span></td>
+                <td>${num(x.waystone_per100, 4)}</td>
+                <td>${num(x.maia_per100, 4)}</td>
+                <td>${num(x.ga10_t0_per100, 4)}</td>
+                <td>${num(x.ga10_c1_per100, 4)}</td>
+                ${diffCell(dmw)}
+                ${diffCell(dgc)}</tr>`;
         }).join('');
-        $('accrued').innerHTML = rows
-            ? `<table><thead><tr><th>ISIN</th><th>Admin accrued (base)</th>
-               <th>GA10 accrued /100</th></tr></thead><tbody>${rows}</tbody></table>
-               ${Object.keys(marks).length ? '' :
-                 '<div class="muted">GA10 marks unavailable for this book — admin column only.</div>'}`
-            : '<div class="muted">needs the per-bond join</div>';
+        $('accrued').innerHTML =
+            `<div class="src" style="margin-bottom:8px">${esc(ar.basis)}</div>
+             <table><thead><tr><th>Bond</th><th>Waystone</th><th>Maia</th>
+                <th>GA10 T+0</th><th>GA10 C+1</th>
+                <th>&Delta; M&minus;W</th><th>&Delta; GA10c1&minus;W</th></tr></thead>
+                <tbody>${rows}</tbody></table>
+             <div class="src" style="margin-top:6px">GA10 coverage ${esc(ar.ga10_coverage)}`
+            + ((ar.ga10_missing || []).length
+                ? ` — not enrolled: ${ar.ga10_missing.map(esc).join(', ')}`
+                : '') + `</div>`;
     }
 
     function renderFx(r) {
