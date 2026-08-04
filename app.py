@@ -375,6 +375,30 @@ async def aum_comparison(request: Request, fund: str, date: str = None):
     return result
 
 
+@app.get("/aum/{fund}/briefing.md")
+async def aum_briefing_md(request: Request, fund: str, date: str = None):
+    """The one-page board brief as raw markdown (for packs/emails)."""
+    denied = await _aum_gate(request)
+    if denied:
+        return denied
+    import funds as _funds
+    import aum_orchestrator
+    pid = _funds.resolve(fund)
+    if not pid:
+        raise HTTPException(status_code=404, detail=f"unknown fund {fund}")
+    result = await aum_orchestrator.build_aum_comparison(pid, date)
+    if result.get("error"):
+        raise HTTPException(status_code=result.pop("status", 500),
+                            detail=result["error"])
+    from fastapi.responses import Response
+    vdate = (result.get("meta") or {}).get("valuation_date") or "latest"
+    return Response(
+        content=result.get("briefing_md") or "",
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition":
+                 f'attachment; filename="recon_brief_{pid}_{vdate}.md"'})
+
+
 @app.get("/aum/{fund}/dates")
 async def aum_dates(request: Request, fund: str):
     denied = await _aum_gate(request)
@@ -458,12 +482,17 @@ async def aum_upload_auto(
     if kind["type"] == "admin_pack":
         result = await process_admin_upload(contents, file.filename, who)
         result["detected_type"] = "admin_pack"
+        # Warm the report cache so the first human view of this valuation
+        # is ~1s, not a 100s GA10 build.
+        aum_orchestrator.prewarm(result.get("portfolio_id") or pid,
+                                 result.get("date"))
         return result
     if kind["type"] in ("maia_priced", "maia_full", "maia_allocation"):
         result = await aum_orchestrator.ingest_maia(pid, contents, file.filename, who)
         if result.get("status") == "error":
             raise HTTPException(status_code=422, detail=result.get("error"))
         result["detected_type"] = kind["type"]
+        aum_orchestrator.prewarm(pid, result.get("date"))
         return result
     if kind["type"] in ("maia_aum", "maia_positions", "maia_compliance"):
         # Not (yet) consumable by the comparison — keep the file, dated by

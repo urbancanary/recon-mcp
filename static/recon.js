@@ -39,6 +39,67 @@
     }
 
     // ── sections ────────────────────────────────────────────────────────
+    // ── Board brief: the landing view. Tiny renderer for the md subset the
+    // server emits (h1/h2, bold, tables, ordered/unordered lists, paras) —
+    // trusted input only (our own generated brief), but escaped anyway.
+    function mdToHtml(md) {
+        const lines = String(md || '').split('\n');
+        let html = '', inUl = false, inOl = false, inTable = false;
+        const closeLists = () => {
+            if (inUl) { html += '</ul>'; inUl = false; }
+            if (inOl) { html += '</ol>'; inOl = false; }
+            if (inTable) { html += '</tbody></table>'; inTable = false; }
+        };
+        const inline = (s) => esc(s)
+            .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+            .replace(/`(.+?)`/g, '<code>$1</code>');
+        for (const raw of lines) {
+            const line = raw.trimEnd();
+            if (/^\|[\s-|:]+\|$/.test(line)) continue; // separator row
+            if (line.startsWith('| ') || /^\|.+\|$/.test(line)) {
+                const cells = line.replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+                if (!inTable) {
+                    closeLists();
+                    html += '<table><thead><tr>' + cells.map(c =>
+                        `<th>${inline(c)}</th>`).join('') + '</tr></thead><tbody>';
+                    inTable = 'head';
+                    continue;
+                }
+                html += '<tr>' + cells.map((c, ix) =>
+                    `<td${ix === 0 ? ' class="lbl"' : ''}>${inline(c)}</td>`).join('') + '</tr>';
+                continue;
+            }
+            if (inTable) { html += '</tbody></table>'; inTable = false; }
+            if (line.startsWith('## ')) { closeLists(); html += `<h2>${inline(line.slice(3))}</h2>`; }
+            else if (line.startsWith('# ')) { closeLists(); html += `<h1>${inline(line.slice(2))}</h1>`; }
+            else if (/^\d+\.\s/.test(line)) {
+                if (!inOl) { closeLists(); html += '<ol>'; inOl = true; }
+                html += `<li>${inline(line.replace(/^\d+\.\s/, ''))}</li>`;
+            } else if (line.startsWith('- ')) {
+                if (!inUl) { closeLists(); html += '<ul>'; inUl = true; }
+                html += `<li>${inline(line.slice(2))}</li>`;
+            } else if (line === '') { closeLists(); }
+            else { closeLists(); html += `<p>${inline(line)}</p>`; }
+        }
+        closeLists();
+        return html;
+    }
+
+    function renderBriefing(r) {
+        const md = r.briefing_md;
+        const el = $('briefing');
+        if (!md) { el.innerHTML = ''; return; }
+        // Seriousness accent from the assessment level for the left border.
+        const level = ((r.assessment || {}).level) || '';
+        el.className = 'brief ' + (
+            level === 'material_unexplained' || level === 'investigate' ? 'brief-high'
+            : (r.fx_forward_alert || {}).alert ? 'brief-attn' : 'brief-ok');
+        el.innerHTML = mdToHtml(md);
+        const dl = $('downloadBrief');
+        if (dl) dl.href = `/aum/${state.fund}/briefing.md`
+            + (state.date ? `?date=${state.date}` : '');
+    }
+
     // Management summary — never "AGREES" while a difference exists. The
     // headline states the gap; the cause ladder assigns every dollar of it;
     // the constant-price line says what a single price source would leave.
@@ -433,6 +494,7 @@
             const url = `/aum/${state.fund}` + (state.date ? `?date=${state.date}` : '');
             const r = await jget(url);
             if (seq !== _loadSeq) return; // superseded by a newer selection
+            renderBriefing(r);
             renderVerdict(r); renderDateWarning(r); renderAum(r); renderEvidence(r);
             renderAttribution(r); renderBonds(r); renderPrices(r); renderAccrued(r);
             renderFx(r); renderCurrency(r);
@@ -443,6 +505,14 @@
             $('status').innerHTML = `<span class="err">${esc(e.message)}</span>`;
         }
     }
+
+    $('toggleDetail').addEventListener('click', () => {
+        const d = $('detail');
+        const open = d.style.display !== 'none';
+        d.style.display = open ? 'none' : '';
+        $('toggleDetail').innerHTML = open
+            ? 'Show full detail &#9662;' : 'Hide full detail &#9652;';
+    });
 
     $('fund').addEventListener('change', async () => {
         state.fund = $('fund').value;

@@ -193,6 +193,13 @@ async def _ga10_batch(prices: dict, settle_iso: str, api_key: str) -> dict:
     return {**left, **right}
 
 
+# GA10 marks are deterministic for a stored pack (same ISINs, same admin
+# prices, same settle date), but computing them costs 20s+ — two settle
+# dates, sequential batching, and the un-enrolled bonds force a re-split on
+# EVERY call. Cache per (settle date, price set); ~a few KB per valuation.
+_marks_cache: dict = {}
+
+
 async def _ga10_marks(holdings: list[dict], settle_iso: str) -> dict:
     """{isin: {clean_price, accrued_per_100, accrued_per_100_c1, ...}} from
     GA10 at the admin's own prices, at TWO settlement dates:
@@ -212,6 +219,10 @@ async def _ga10_marks(holdings: list[dict], settle_iso: str) -> dict:
               if h.get("isin") and h.get("price")}
     if not prices:
         return {}
+    cache_key = (settle_iso, tuple(sorted(prices.items())))
+    hit = _marks_cache.get(cache_key)
+    if hit is not None:
+        return hit
     api_key = get_api_key("GA10_API_KEY", requester="recon-mcp-aum")
     if not api_key:
         return {}
@@ -235,6 +246,12 @@ async def _ga10_marks(holdings: list[dict], settle_iso: str) -> dict:
             "coupon": b.get("coupon"),
             "analytics_source": "GA10",
         }
+    # Only cache a run that actually produced marks — an empty result from
+    # a GAE outage must not stick until restart.
+    if out:
+        if len(_marks_cache) > 64:
+            _marks_cache.clear()
+        _marks_cache[cache_key] = out
     return out
 
 
@@ -255,6 +272,21 @@ async def available_dates(pid: str) -> dict:
 
 
 # ── The comparison itself ───────────────────────────────────────────────────
+
+# Assembled-report cache. The payload is deterministic given the exact set
+# of stored files, so the key is (fund, anchor date) and the value carries a
+# registry FINGERPRINT — any new/replaced upload for the fund changes the
+# fingerprint and the next request rebuilds. Measured: cold build 112s
+# (GA10 batching dominates), fingerprint hit ~1s.
+_result_cache: dict = {}
+_RESULT_TTL = 6 * 3600
+
+
+def _registry_fingerprint(*reg_lists) -> tuple:
+    return tuple(sorted(
+        (r.get("file_path") or "", r.get("uploaded_at") or "")
+        for reg in reg_lists for r in reg))
+
 
 async def build_aum_comparison(pid: str, date: str | None = None) -> dict:
     """Full AUM comparison payload for a fund.
@@ -284,6 +316,12 @@ async def build_aum_comparison(pid: str, date: str | None = None) -> dict:
         return {"error": f"no administrator valuation for {anchor} — "
                          f"available: {', '.join(admin_dates[:8])}",
                 "status": 404}
+
+    import time as _time
+    fp = _registry_fingerprint(admin_reg, maia_reg, ref_reg)
+    hit = _result_cache.get((pid, anchor))
+    if hit and hit[0] == fp and (_time.time() - hit[1]) < _RESULT_TTL:
+        return hit[2]
 
     # ── Maia side: SAME DATE ONLY. Files are stored under their RESOLVED
     # data date; among same-date shapes the newest upload wins (the richer
@@ -509,8 +547,27 @@ async def build_aum_comparison(pid: str, date: str | None = None) -> dict:
     # (both books at the administrator's own marks) states what remains
     # once time-of-day pricing is stripped out.
     result["assessment"] = _build_assessment(result, maia_breakdown, parsed)
+    result["briefing_md"] = _briefing_md(result)
 
+    if len(_result_cache) > 64:
+        _result_cache.clear()
+    _result_cache[(pid, anchor)] = (fp, _time.time(), result)
     return result
+
+
+def prewarm(pid: str, date: str | None = None):
+    """Fire-and-forget cache fill — called after an upload lands so the
+    first human view of a new valuation is warm, not a 100s build."""
+    async def _run():
+        try:
+            await build_aum_comparison(pid, date)
+            logger.info("aum prewarm done: %s %s", pid, date or "latest")
+        except Exception as e:
+            logger.warning("aum prewarm failed: %s %s: %s", pid, date, e)
+    try:
+        asyncio.get_running_loop().create_task(_run())
+    except RuntimeError:
+        pass  # no loop (sync caller/test) — skip, first view builds cold
 
 
 def _fx_forward_alert(currency: dict | None, threshold_pts: float = 5.0) -> dict:
@@ -609,6 +666,114 @@ def _accrued_recon(parsed: dict, maia_bond_rows: list[dict],
         "ga10_missing": ga10_missing,
         "ga10_coverage": f"{len(rows) - len(ga10_missing)}/{len(rows)}",
     }
+
+
+def _briefing_md(result: dict) -> str:
+    """One-page board-style brief, generated from the computed payload only
+    — conclusion first, seriousness stated, actions listed. The reader who
+    wants the per-bond evidence scrolls the full report; this page is what
+    goes in the pack."""
+    meta = result.get("meta") or {}
+    a = result.get("assessment") or {}
+    i = result.get("integrity") or {}
+    fx = result.get("fx_forward_alert") or {}
+    cf = result.get("compliance_file") or {}
+    ar = result.get("accrued_recon") or {}
+    ev = result.get("evidence_report") or {}
+    fund = meta.get("fund_name") or "Fund"
+    vdate = meta.get("valuation_date") or "?"
+
+    # Seriousness: driven by the assessment level, lifted by standing alerts.
+    level = a.get("level")
+    if level in ("material_unexplained", "investigate"):
+        serious, why = "HIGH", "the difference is not fully explained"
+    elif fx.get("alert"):
+        serious, why = ("ATTENTION REQUIRED",
+                        "valuations reconcile, but a control issue is open "
+                        "(share-class FX forwards distorting compliance "
+                        "measures)")
+    elif level == "explained_not_identical":
+        serious, why = ("MODERATE",
+                        "differences are explained but two causes await "
+                        "confirmation")
+    else:
+        serious, why = "ROUTINE", "the systems state the same total"
+
+    L = []
+    L.append(f"# Fund reconciliation — board brief")
+    L.append(f"**{fund}** · valuation {vdate}"
+             + (f" {meta.get('valuation_time')}" if meta.get("valuation_time") else "")
+             + f" · front office vs administrator vs independent (GA10)")
+    L.append("")
+    L.append(f"## Conclusion — seriousness: {serious}")
+    if a.get("available"):
+        L.append(a.get("headline", ""))
+    L.append(f"Basis for the rating: {why}.")
+    L.append("")
+    if i:
+        L.append("## The number")
+        L.append(f"Front office **{i.get('maia_total'):,.2f}** vs administrator "
+                 f"**{i.get('admin_nav'):,.2f}** = **{i.get('difference'):,.2f}** "
+                 f"({i.get('difference_pct'):+.2f}%).")
+        cp = a.get("constant_price")
+        if cp:
+            L.append(f"Stripping time-of-day pricing (both books at the "
+                     f"administrator's marks): **{cp['remaining_difference']:,.2f}** "
+                     f"({cp['remaining_pct']:+.3f}%) remains — the part a single "
+                     f"price source would not remove.")
+        L.append("")
+    if a.get("causes"):
+        L.append("## Where every dollar of the gap sits")
+        L.append("| Cause | Amount | Status |")
+        L.append("|---|---:|---|")
+        for c in a["causes"]:
+            L.append(f"| {c['cause']} | {c['amount']:,.2f} | "
+                     f"{c['status'].replace('_', ' ')} |")
+        L.append("")
+    actions = []
+    if fx.get("alert"):
+        ccys = ", ".join(f"{c['currency']} ({c['pct_nav_fund']}% fund vs "
+                         f"{c['pct_nav_all_in']}% all-in)"
+                         for c in fx.get("currencies") or [])
+        actions.append(f"**Exclude share-class FX forwards from currency "
+                       f"compliance tests.** They distort exposure in {ccys}; "
+                       f"alerts fire on phantom positions while a real breach "
+                       f"could read as hedged.")
+    if cf.get("report_date") and not cf.get("supplied_for_date"):
+        actions.append(f"**Compliance report not supplied for {cf['report_date']}**"
+                       + (f" (latest on file {cf['latest_on_file']})"
+                          if cf.get("latest_on_file") else "")
+                       + ". Decide whether a backdated run is required.")
+    for c in a.get("causes") or []:
+        if c["status"] == "question_open" and abs(c["amount"]) >= 100:
+            actions.append(f"**Confirm: {c['cause'].lower()}** "
+                           f"({c['amount']:+,.2f}). {c['action']}")
+        if c["status"] == "investigate":
+            actions.append(f"**Investigate unexplained {c['amount']:+,.2f}** "
+                           f"before either figure is relied on.")
+    if ar.get("ga10_missing"):
+        actions.append(f"**Enrol {len(ar['ga10_missing'])} bonds for independent "
+                       f"verification** — GA10 coverage {ar.get('ga10_coverage')}; "
+                       f"until then their accrued has no third check.")
+    if actions:
+        L.append("## Actions required")
+        for n, act in enumerate(actions, 1):
+            L.append(f"{n}. {act}")
+        L.append("")
+    L.append("## Scope and caveats")
+    scope = ev.get("scope") or {}
+    if scope.get("affects"):
+        L.append(f"- {scope['affects']}")
+    L.append(f"- One fund, one valuation date. Independent (GA10) accrued "
+             f"coverage: {ar.get('ga10_coverage', 'n/a')}.")
+    L.append("- The Athena column derives from the administrator's book for "
+             "this fund — identity, not corroboration, until Athena prices "
+             "independently.")
+    maia_f = (meta.get("maia") or {}).get("file")
+    L.append(f"- Sources: administrator `{meta.get('admin_file')}`"
+             + (f", front office `{maia_f}`" if maia_f else ", no front-office view for this date")
+             + ". Full per-bond evidence in the detailed report below.")
+    return "\n".join(L)
 
 
 def _build_assessment(result: dict, maia_breakdown: dict | None,
