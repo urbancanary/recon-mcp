@@ -421,6 +421,65 @@ async def aum_upload_maia(
     return result
 
 
+@app.post("/aum/upload/auto")
+async def aum_upload_auto(
+    request: Request,
+    file: UploadFile = File(...),
+    fund: str = "gdbf",
+    x_user_email: str = Header(None, alias="X-User-Email"),
+):
+    """Content-routed intake for the OneDrive MAIA folder (or any drop).
+
+    Filenames there carry no signal (tempMaia…, 'maia postions gdbf'), so
+    the TYPE comes from reading the file (maia_classify): administrator
+    packs → the admin pipeline; parseable Maia position/priced/allocation
+    views → the AUM-recon ingest; AUM summaries and compliance dumps →
+    raw-stored under their own registry source (kept, dated, not yet used
+    by the comparison); anything else → rejected with the reason."""
+    denied = await _aum_gate(request)
+    if denied:
+        return denied
+    import funds as _funds
+    import aum_orchestrator
+    import maia_classify
+    import recon_db
+    pid = _funds.resolve(fund)
+    if not pid:
+        raise HTTPException(status_code=404, detail=f"unknown fund {fund}")
+    contents = await file.read()
+    if len(contents) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large (max 10MB)")
+
+    kind = {"type": "unknown", "detail": "not an xlsx"}
+    if (file.filename or "").lower().endswith((".xlsx", ".xls")):
+        kind = maia_classify.classify_xlsx(contents)
+
+    who = x_user_email or "unknown"
+    if kind["type"] == "admin_pack":
+        result = await process_admin_upload(contents, file.filename, who)
+        result["detected_type"] = "admin_pack"
+        return result
+    if kind["type"] in ("maia_priced", "maia_full", "maia_allocation"):
+        result = await aum_orchestrator.ingest_maia(pid, contents, file.filename, who)
+        if result.get("status") == "error":
+            raise HTTPException(status_code=422, detail=result.get("error"))
+        result["detected_type"] = kind["type"]
+        return result
+    if kind["type"] in ("maia_aum", "maia_positions", "maia_compliance"):
+        # Not (yet) consumable by the comparison — keep the file, dated by
+        # upload day, under its own source so nothing from the folder is
+        # silently dropped and a later feature can read the history.
+        from datetime import date as _d
+        src = {"maia_aum": "maia_aum_summary", "maia_positions": "maia_pos_raw",
+               "maia_compliance": "maia_ptc"}[kind["type"]]
+        path = await recon_db.store_raw_upload(
+            src, pid, _d.today().isoformat(), contents, file.filename, who)
+        return {"status": "stored", "detected_type": kind["type"],
+                "detail": kind["detail"], "stored": path}
+    raise HTTPException(status_code=422,
+                        detail=f"unrecognised content: {kind['detail']}")
+
+
 @app.get("/aum/{fund}/uploads")
 async def aum_uploads(request: Request, fund: str):
     """Upload history for the AUM recon sources (audit trail for the UI)."""
@@ -433,7 +492,8 @@ async def aum_uploads(request: Request, fund: str):
     if not pid:
         raise HTTPException(status_code=404, detail=f"unknown fund {fund}")
     rows = await recon_db.list_uploads(portfolio_id=pid)
-    keep = {"maia_aum", "maia_ref", "admin", "admin_payload"}
+    keep = {"maia_aum", "maia_ref", "admin", "admin_payload",
+            "maia_aum_summary", "maia_pos_raw", "maia_ptc"}
     return {"uploads": [r for r in rows if r.get("source") in keep]}
 
 
