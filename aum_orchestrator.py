@@ -259,12 +259,13 @@ async def available_dates(pid: str) -> dict:
 async def build_aum_comparison(pid: str, date: str | None = None) -> dict:
     """Full AUM comparison payload for a fund.
 
-    ``date`` pins the Maia side; default is the newest dated Maia export.
-    The administrator pack is then DATE-MATCHED to the Maia view actually
-    used — order matters and got this wrong twice in Athena (see the ported
-    comments): defaulting the admin side to "latest" silently reconciled a
-    30 Jul pack against a 24 Jul Maia export and reported six days of market
-    movement as "difference".
+    THE ADMINISTRATOR'S CALENDAR ANCHORS THE REPORT: ``date`` (or, by
+    default, the latest stored Waystone pack) picks the valuation date, and
+    the Maia side joins ONLY if a view exists for that same date. Never a
+    cross-date comparison — on an Irish bank holiday Waystone strikes no
+    NAV, and defaulting to the newest Maia date used to pair a fresh Maia
+    file against an older pack and report days of market movement as
+    "difference". No same-day Maia → administrator-only view, said plainly.
     """
     if pid not in FUNDS or pid not in aum_funds():
         return {"error": f"fund {pid} has no AUM reconciliation", "status": 404}
@@ -276,18 +277,26 @@ async def build_aum_comparison(pid: str, date: str | None = None) -> dict:
         return {"error": f"no stored administrator valuation for {pid}",
                 "status": 404}
 
-    # ── Maia side first. Files are stored under their RESOLVED data date, so
-    # date ranking is the registry key; capability breaks ties between shapes
-    # of the same snapshot (the 34-col priced view outranks the 13-col
-    # allocation view; the 629-col full export loses on forwards-as-gross-legs
-    # but wins on ISIN — the breakdown's capability score encodes that).
+    admin_dates = sorted({r.get("date") for r in admin_reg if r.get("date")},
+                         reverse=True)
+    anchor = date or admin_dates[0]
+    if anchor not in admin_dates:
+        return {"error": f"no administrator valuation for {anchor} — "
+                         f"available: {', '.join(admin_dates[:8])}",
+                "status": 404}
+
+    # ── Maia side: SAME DATE ONLY. Files are stored under their RESOLVED
+    # data date; among same-date shapes the newest upload wins (the richer
+    # re-export typically arrives later — proper capability ranking is
+    # backlog 2526).
     maia = maia_breakdown = None
-    maia_meta = {"available": False}
+    maia_meta = {"available": False,
+                 "error": f"no Maia view dated {anchor} on record"}
     maia_rows_bonds = []
     maia_date = None
     maia_path = None
 
-    cand = [r for r in maia_reg if not date or r.get("date") == date]
+    cand = [r for r in maia_reg if r.get("date") == anchor]
     cand.sort(key=lambda r: (r.get("date") or "", r.get("uploaded_at") or ""),
               reverse=True)
     for row in cand:
@@ -316,9 +325,7 @@ async def build_aum_comparison(pid: str, date: str | None = None) -> dict:
 
     # ── Administrator pack: same date as the Maia view actually used, else
     # the newest on record (or the explicitly requested date).
-    want = maia_date or date
-    admin_row = next((r for r in admin_reg if r.get("date") == want), None) \
-        or max(admin_reg, key=lambda r: r.get("date") or "")
+    admin_row = next(r for r in admin_reg if r.get("date") == anchor)
     parsed = None
     payload_rows = await _registry(pid, SRC_ADMIN_PAYLOAD)
     pay = next((r for r in payload_rows if r.get("date") == admin_row.get("date")), None)

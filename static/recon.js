@@ -63,8 +63,12 @@
         const a = r.assessment;
         const i = r.integrity;
         if (!a || !a.available) {
+            const maiaErr = ((r.meta || {}).maia || {}).error;
             $('verdict').innerHTML = i ? `<div class="banner ${i.material ? 'bad' : 'warn'}">
-                ${esc(i.verdict)}</div>` : '';
+                ${esc(i.verdict)}</div>`
+                : maiaErr ? `<div class="banner warn"><b>ADMINISTRATOR-ONLY VIEW</b> —
+                    ${esc(maiaErr)}. No front-office comparison for this date; the
+                    tables below show the administrator's valuation alone.</div>` : '';
             return;
         }
         const ladder = (a.causes || []).map(c => {
@@ -403,11 +407,16 @@
     }
 
     async function loadDates() {
+        // The ADMINISTRATOR's calendar drives the picker: Waystone strikes
+        // no NAV on Irish holidays, and a Maia-led default used to pair
+        // fresh Maia files against older packs. Latest Waystone first;
+        // days without a same-day Maia view are labelled, not hidden.
         const d = await jget(`/aum/${state.fund}/dates`);
-        const opts = (d.maia_dates || []).map(x =>
-            `<option value="${x}">${x}${(d.matched_dates || []).includes(x)
-                ? '' : ' (no same-day admin pack)'}</option>`);
-        $('datePair').innerHTML = opts.join('') || '<option value="">no Maia exports</option>';
+        const matched = new Set(d.matched_dates || []);
+        const opts = (d.admin_dates || []).map(x =>
+            `<option value="${x}">${x}${matched.has(x)
+                ? '' : ' (admin only — no Maia view)'}</option>`);
+        $('datePair').innerHTML = opts.join('') || '<option value="">no administrator packs</option>';
         state.date = $('datePair').value || null;
     }
 
