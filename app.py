@@ -354,6 +354,21 @@ async def list_funds(request: Request):
     ]}
 
 
+@app.get("/aum/funds")
+async def aum_funds_list():
+    """Funds this service can actually reconcile — DERIVED from stored data.
+
+    Declared BEFORE /aum/{fund} because FastAPI matches in definition order and
+    the parameterised route would otherwise swallow "funds" as a fund id.
+
+    Exists so consumers stop hardcoding fund lists. Athena gated its recon pages
+    on sets written into router.js, which went stale and were inverted in
+    practice — Recon Report was offered only for a model portfolio that has no
+    administrator, while the fund with a live feed could not reach it.
+    """
+    return {"funds": aum_orchestrator.aum_funds()}
+
+
 @app.get("/aum/{fund}")
 async def aum_comparison(request: Request, fund: str, date: str = None):
     """Full three-way AUM comparison payload for a fund (see aum_orchestrator).
