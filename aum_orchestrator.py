@@ -275,7 +275,11 @@ async def _athena_txn_valuation(pid: str, date: str | None) -> dict | None:
     import hmac as _hmac
     try:
         from auth_client import get_api_key, get_service_url
-        base = (get_service_url("ATHENA_URL") or "").rstrip("/")
+        # ATHENA_API_URL is the PRE-EXISTING auth-mcp key for the Athena app
+        # (resolves to athena.guinness.x-trillion.com; live-verified
+        # 2026-08-11 serving this endpoint) — reuse it, don't mint a
+        # duplicate ATHENA_URL.
+        base = (get_service_url("ATHENA_API_URL") or "").rstrip("/")
         key = get_api_key("ATHENA_SERVICE_KEY") or ""
         if not base or not key:
             return None
