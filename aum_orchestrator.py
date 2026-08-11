@@ -30,6 +30,7 @@ from pathlib import Path
 
 import httpx
 
+import accrual_boundary
 import aum_passes
 import aum_recon
 import bond_recon
@@ -762,6 +763,14 @@ def _accrued_recon(parsed: dict, maia_bond_rows: list[dict],
             "diff_ga10c1_waystone": round(g_c1 - w100, 4)
             if (g_c1 is not None and w100 is not None) else None,
         })
+    # MONTH-END ACCRUAL BOUNDARY. Where a coupon pays exactly at the accrual
+    # point, C+1 accrued resets to nil while the cash has not been received —
+    # a full coupon then sits in no line of the valuation. Adds the
+    # entitlement-basis column and names any bond affected; every field above
+    # is left as it was (see accrual_boundary for the measurement and the
+    # revert note).
+    valn = accrual_boundary.apply(rows)
+
     return {
         "basis": "accrued per 100 of par, local currency (FX-independent). "
                  "Waystone accrues to MARKET SETTLEMENT — compare it against "
@@ -769,6 +778,7 @@ def _accrued_recon(parsed: dict, maia_bond_rows: list[dict],
         "rows": rows,
         "ga10_missing": ga10_missing,
         "ga10_coverage": f"{len(rows) - len(ga10_missing)}/{len(rows)}",
+        "valn_basis": valn,
     }
 
 
