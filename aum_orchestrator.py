@@ -30,6 +30,7 @@ from pathlib import Path
 
 import httpx
 
+import aum_passes
 import aum_recon
 import bond_recon
 import currency_hedge_recon
@@ -255,6 +256,50 @@ async def _ga10_marks(holdings: list[dict], settle_iso: str) -> dict:
     return out
 
 
+# ── Athena transactions valuation (the injected side) ──────────────────────
+#
+# Athena is building GET /api/internal/txn-valuation/{fund}?date=YYYY-MM-DD
+# (service-key protected: X-Service-Key = hex HMAC-SHA256(ATHENA_SERVICE_KEY,
+# b"athena-internal"), confirmed 2026-08-10, Athena commit c9b1a87). Until it
+# is DEPLOYED the fetch fails and the Athena side stays derived_from_admin —
+# the seam exists so flipping to the real side is a data change, not a code
+# change. `athena.source` in the payload says which one the reader is seeing.
+
+async def _athena_txn_valuation(pid: str, date: str | None) -> dict | None:
+    """Fetch Athena's own transactions-book valuation, or None (→ fallback
+    to derived_from_admin). Never raises; never partially succeeds silently —
+    a payload without holdings+totals is treated as absent."""
+    if not date:
+        return None
+    import hashlib
+    import hmac as _hmac
+    try:
+        from auth_client import get_api_key, get_service_url
+        base = (get_service_url("ATHENA_URL") or "").rstrip("/")
+        key = get_api_key("ATHENA_SERVICE_KEY") or ""
+        if not base or not key:
+            return None
+        token = _hmac.new(key.encode(), b"athena-internal",
+                          hashlib.sha256).hexdigest()
+        async with httpx.AsyncClient(timeout=15.0) as c:
+            r = await c.get(f"{base}/api/internal/txn-valuation/{pid}",
+                            params={"date": date},
+                            headers={"X-Service-Key": token})
+        if r.status_code != 200:
+            logger.info("athena txn-valuation %s %s: HTTP %s — using "
+                        "derived_from_admin", pid, date, r.status_code)
+            return None
+        body = r.json()
+        if not (body.get("holdings") and body.get("totals")):
+            logger.warning("athena txn-valuation %s %s: incomplete payload "
+                           "— using derived_from_admin", pid, date)
+            return None
+        return body
+    except Exception as e:
+        logger.info("athena txn-valuation unavailable (%s %s): %s", pid, date, e)
+        return None
+
+
 # ── Date inventory ──────────────────────────────────────────────────────────
 
 async def available_dates(pid: str) -> dict:
@@ -391,7 +436,12 @@ async def build_aum_comparison(pid: str, date: str | None = None) -> dict:
                                         maia_breakdown.get("forwards"))
 
     waystone = nav_comparison.waystone_side(parsed)
-    athena = nav_comparison.athena_side(parsed)
+    athena_txn = await _athena_txn_valuation(pid, parsed.get("valuation_date"))
+    if athena_txn:
+        athena = aum_passes.athena_txn_to_side(athena_txn)
+    else:
+        athena = nav_comparison.athena_side(parsed)
+        athena["source"] = "derived_from_admin"
 
     result = nav_comparison.build(maia or {}, athena, waystone, meta={
         "portfolio_id": pid,
@@ -464,6 +514,46 @@ async def build_aum_comparison(pid: str, date: str | None = None) -> dict:
                      "one to bridge Ticker to ISIN",
         }
     result["bonds"] = _bonds
+
+    # ── THE ATHENA SIDE'S PROVENANCE, stated at top level so the UI can
+    # label honestly: "transactions" is Athena's own book; "derived_from_
+    # admin" is the administrator re-presented, agreement by construction.
+    result["athena"] = {
+        "source": athena.get("source"),
+        "coverage": athena.get("coverage"),
+        "caveats": athena.get("caveats") or [],
+    }
+
+    # ── TWO-PASS COMPARISON. Pass 1 is the table above (each provider on
+    # its own prices/FX). Pass 2 revalues every side's OWN par at the
+    # administrator's price and FX — constant prices, varying par — so
+    # position/completeness mistakes separate visually from marks.
+    maia_bonds_p2 = None
+    if _bonds:
+        maia_bonds_p2 = {
+            r["isin"]: {"par": r["maia_par"],
+                        "own_value_base": r.get("maia_exposure_base")}
+            for r in _bonds.get("rows") or []
+            if r.get("in_maia") and r.get("maia_par") is not None}
+    athena_par_p2 = None
+    if athena_txn:
+        athena_par_p2 = {h["isin"]: h["par"]
+                         for h in athena_txn.get("holdings") or []
+                         if h.get("isin") and h.get("par") is not None}
+    result["passes"] = {
+        "own": {
+            "basis": "Each provider on its own prices and FX rates — "
+                     "differences mix positions, marks and FX.",
+            "rows": result["rows"],
+            "total": result["total"],
+        },
+        "admin_priced": aum_passes.admin_priced_pass(
+            parsed,
+            sides={"maia": maia or {}, "athena": athena, "waystone": waystone},
+            maia_bonds=maia_bonds_p2,
+            athena_par=athena_par_p2,
+            bonds_meta=_bonds),
+    }
 
     # ── Evidence report: findings with magnitude/status/scope, every sentence
     # derived from figures already computed. funds_total from the registry so

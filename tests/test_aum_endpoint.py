@@ -42,9 +42,15 @@ def client(tmp_path, monkeypatch):
     async def no_marks(holdings, date):
         return {}
 
+    async def no_txn(pid, date):
+        # Athena's txn-valuation endpoint is fetched live in prod; tests
+        # must not reach for auth-mcp/network. None → derived_from_admin.
+        return None
+
     monkeypatch.setattr(ao, "_registry", fake_registry)
     monkeypatch.setattr(ao, "_cached", fake_cached)
     monkeypatch.setattr(ao, "_ga10_marks", no_marks)
+    monkeypatch.setattr(ao, "_athena_txn_valuation", no_txn)
     return TestClient(app_module.app)
 
 
@@ -54,9 +60,22 @@ def test_aum_endpoint_full_payload(client):
     body = r.json()
     for key in ("rows", "total", "notes", "integrity", "attribution",
                 "evidence_report", "prices", "currency", "meta",
-                "assessment", "compliance_file", "fx_forward_alert"):
+                "assessment", "compliance_file", "fx_forward_alert",
+                "passes", "athena"):
         assert key in body, key
     assert body["meta"]["dates_match"] is True
+
+    # Two-pass section: pass 1 is the top-level table; pass 2 is the
+    # admin-priced revaluation and its Waystone identity must hold.
+    assert body["athena"]["source"] == "derived_from_admin"
+    passes = body["passes"]
+    assert passes["own"]["rows"] == body["rows"]
+    ap = passes["admin_priced"]
+    assert ap["identity_check"]["holds"] is True
+    p2 = {r["key"]: r for r in ap["rows"]}
+    # Fixture book: Maia par == admin par, so pass 2 collapses the sides.
+    assert p2["clean_bond_mv"]["maia"] == p2["clean_bond_mv"]["waystone"]
+    assert p2["other_net"]["maia"] is None  # null, never zero
     # Fixture book agrees to the cent → not material.
     assert body["integrity"]["material"] is False
     assert body["attribution"]["available"] is True
