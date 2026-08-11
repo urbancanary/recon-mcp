@@ -79,4 +79,27 @@ def test_apply_says_so_plainly_when_nothing_fires():
              "ga10_t0_per100": 1.0, "ga10_c1_per100": 1.1}]
     summary = ab.apply(rows)
     assert summary["boundary_count"] == 0
+    assert summary["evaluated"] == 1 and summary["tested_of"] == 1
     assert "No bond pays a coupon at the accrual point" in summary["message"]
+
+
+def test_unmarked_bonds_are_reported_not_counted_as_clean():
+    # A bond GA10 cannot mark at both settle dates is a BLIND SPOT. The
+    # summary must say so — "no boundary bonds" over an untested book is a
+    # claim the data does not support.
+    rows = [
+        {"isin": "MARKED", "par": 1000,
+         "ga10_t0_per100": 1.0, "ga10_c1_per100": 1.1},
+        {"isin": "UNENROLLED", "par": 1000,
+         "ga10_t0_per100": None, "ga10_c1_per100": None},
+    ]
+    summary = ab.apply(rows)
+    assert summary["boundary_count"] == 0
+    assert summary["evaluated"] == 1
+    assert summary["tested_of"] == 2
+    assert summary["unevaluable_isins"] == ["UNENROLLED"]
+    assert "could NOT be tested" in summary["message"]
+    assert "UNENROLLED" in summary["message"]
+    # The untestable bond still gets an honest null, never a fabricated value.
+    assert rows[1]["ga10_valn_per100"] is None
+    assert rows[1]["valn_boundary"] is False

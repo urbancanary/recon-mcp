@@ -79,9 +79,15 @@ def apply(rows: list[dict]) -> dict:
     and how much coupon would otherwise have gone missing. Rows are mutated
     in place; every field they already carry is left exactly as it was.
     """
-    flagged = []
+    flagged, unevaluable = [], []
     for r in rows:
         t0, c1 = r.get("ga10_t0_per100"), r.get("ga10_c1_per100")
+        # A bond GA10 could not mark at BOTH settle dates cannot be tested for
+        # the boundary at all. Silence there would read as "no coupon at
+        # risk", which is a claim the data does not support — so it is
+        # counted and named, not folded into a clean result.
+        if t0 is None or c1 is None:
+            unevaluable.append(r.get("isin"))
         is_b = boundary(t0, c1)
         v = valn_per100(t0, c1)
         r["ga10_valn_per100"] = None if v is None else round(v, 4)
@@ -105,12 +111,23 @@ def apply(rows: list[dict]) -> dict:
                  "reconcile against the administrator's per-bond lines.",
         "boundary_bonds": flagged,
         "boundary_count": len(flagged),
+        # Coverage is part of the finding, not a footnote: the rule can only
+        # speak for bonds marked at both settle dates.
+        "evaluated": len(rows) - len(unevaluable),
+        "tested_of": len(rows),
+        "unevaluable_isins": unevaluable,
         "message": (
             "{} bond(s) pay a coupon exactly at the accrual point this "
             "valuation. Their C+1 accrued is nil while the cash has not been "
             "received, so the coupon sits in no line of the valuation unless "
             "the entitlement basis is used.".format(len(flagged))
             if flagged else
-            "No bond pays a coupon at the accrual point this valuation — the "
-            "entitlement and C+1 bases agree on every line."),
+            "No bond pays a coupon at the accrual point among the {} of {} "
+            "bonds that could be tested.".format(
+                len(rows) - len(unevaluable), len(rows)))
+        + ("" if not unevaluable else
+           " {} bond(s) are not marked by GA10 at both settlement dates and "
+           "could NOT be tested — if one of them pays at the accrual point "
+           "it would go unnoticed. Enrol them to close the gap: {}.".format(
+               len(unevaluable), ", ".join(str(i) for i in unevaluable))),
     }
