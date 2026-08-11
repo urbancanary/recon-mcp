@@ -769,7 +769,7 @@ def _accrued_recon(parsed: dict, maia_bond_rows: list[dict],
     # entitlement-basis column and names any bond affected; every field above
     # is left as it was (see accrual_boundary for the measurement and the
     # revert note).
-    valn = accrual_boundary.apply(rows)
+    coupon_receivable = accrual_boundary.apply(rows)
 
     return {
         "basis": "accrued per 100 of par, local currency (FX-independent). "
@@ -778,7 +778,7 @@ def _accrued_recon(parsed: dict, maia_bond_rows: list[dict],
         "rows": rows,
         "ga10_missing": ga10_missing,
         "ga10_coverage": f"{len(rows) - len(ga10_missing)}/{len(rows)}",
-        "valn_basis": valn,
+        "coupon_receivable": coupon_receivable,
     }
 
 
