@@ -554,6 +554,16 @@ async def build_aum_comparison(pid: str, date: str | None = None) -> dict:
             athena_par=athena_par_p2,
             bonds_meta=_bonds),
     }
+    # Maia figures DRIFT between same-date exports (snapshot timing: the
+    # 31-Jul 14:51 view and the post-switch native-ISIN export tell
+    # different position stories). The file name is therefore part of the
+    # finding, not a footnote — the UI must show it beside the Maia column.
+    if maia_meta.get("available"):
+        result["passes"]["notes"] = [
+            f"Maia columns in BOTH passes derive from "
+            f"{maia_meta.get('file')} (data date {maia_date}). Maia figures "
+            f"drift between same-date exports, so a different export of the "
+            f"same afternoon can tell a different position story."]
 
     # ── Evidence report: findings with magnitude/status/scope, every sentence
     # derived from figures already computed. funds_total from the registry so

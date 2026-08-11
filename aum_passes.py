@@ -22,8 +22,11 @@ cannot be an FX rate, so the pack's "par" is UNITS and the factor bundles
 price-per-unit scaling (GB00BBQ33664, the CCDS — naive par-ratio scaling
 exploded it to +39.2m on 31-Jul). Maia exports units natively, so its par
 ratio is already right; Athena's transactions book stores units×100, so an
-injected Athena par is divided by 100 on flagged ISINs. Flagged ISINs and
-any normalisation applied are carried in the payload, never silent.
+injected Athena par is divided by 100 on flagged ISINs — confirmed
+2026-08-11: the txn-valuation endpoint serves the book VERBATIM (the CCDS
+comes back par 170000 for 1,700 units), so the /100 lives here, not
+server-side. Flagged ISINs and any normalisation applied are carried in
+the payload, never silent.
 
 ACCRUED — TWO ADMIN FIGURES EXIST. Waystone's Σ per-bond accrued does NOT
 equal its balance-sheet Accrued Income line (31-Jul GDBF: 159,094.28 vs
