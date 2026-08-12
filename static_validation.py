@@ -65,25 +65,34 @@ _TRADE_TYPES = ("BUY", "SELL")
 
 
 def _classify(trade: float, ga10: float) -> tuple[str, str]:
-    """(defect, explanation) from the shape of the mismatch."""
+    """(defect, explanation) from the shape of the mismatch.
+
+    DELIBERATELY NOT CLAIMING MORE THAN THE NUMBERS SUPPORT. A value ratio
+    cannot separate a frequency error from a wrong last-coupon date, because
+    real defects COMPOUND: on the measured GDBF book the three annual bonds
+    are modelled semi-annual AND on 30/360, so their ratios came out 0.435,
+    0.156 and 0.251 — nowhere near the clean 0.5 a pure frequency halving
+    would give. An earlier version banded around 0.5 and mis-scored all three.
+
+    So only two verdicts are offered: a small proportional miss is a BASIS
+    difference (dates agree, denominator does not), and anything larger is a
+    PERIOD ANCHOR difference — the accrual start and/or frequency is wrong,
+    and which of the two it is comes from the day counts, not the ratio.
+    """
     if not trade:
         return ("indeterminate", "trade accrued is zero — nothing to scale against")
     ratio = ga10 / trade
-    if 0.45 <= ratio <= 0.55:
-        return ("frequency",
-                "our accrual period is about HALF the trade's — the bond most "
-                "likely pays ANNUAL and is modelled semi-annual")
-    if 1.8 <= ratio <= 2.2:
-        return ("frequency",
-                "our accrual period is about DOUBLE the trade's — the bond "
-                "most likely pays semi-annual and is modelled annual")
     if 0.985 <= ratio <= 1.015:
         return ("day_count",
-                "a basis difference, not a date one — 30/360 against ACT/365 "
-                "is a factor of 1.0139")
-    return ("schedule_or_coupon",
-            "neither a clean period nor a basis difference — check the "
-            "last-coupon/schedule anchoring first, then the coupon rate")
+                "a basis difference, not a date one — the accrual dates agree "
+                "but the denominator does not (30/360 against ACT/365 is a "
+                "factor of 1.0139)")
+    return ("period_anchor",
+            "our accrual period differs materially from the trade's, so the "
+            "assumed last-coupon date and/or the coupon frequency is wrong. "
+            "Compare our accrued_days against the trade-implied days to see "
+            "which: a whole-period offset points at frequency, a partial one "
+            "at the schedule anchoring")
 
 
 async def _orca_trades(pid: str) -> list[dict]:

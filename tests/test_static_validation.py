@@ -6,16 +6,22 @@ reconciles to ACT/365 annual, and our static did not.
 import static_validation as sv
 
 
-def test_frequency_defect_detected_from_halved_period():
-    # Vodafone: trade 6.991781 (8.000 x 319/365), ours 3.044444 (8 x 137/360).
-    defect, why = sv._classify(6.991781, 3.044444)
-    assert defect == "frequency"
-    assert "ANNUAL" in why
+def test_real_compound_defects_score_as_period_anchor():
+    # The three measured GDBF misses. Each is a wrong anchor AND a wrong
+    # basis, so the ratios (0.435 / 0.156 / 0.251) are nowhere near the clean
+    # 0.5 a pure frequency halving would give — an earlier version banded
+    # around 0.5 and mis-scored all three.
+    for trade, ours in ((6.991781, 3.044444),    # Vodafone,  ratio 0.435
+                        (4.344177, 0.676042),    # SW Finance, ratio 0.156
+                        (4.558219, 1.145833)):   # PIC,        ratio 0.251
+        defect, why = sv._classify(trade, ours)
+        assert defect == "period_anchor"
+        assert "last-coupon" in why
 
 
-def test_doubled_period_also_reads_as_frequency():
+def test_over_accrual_also_scores_as_period_anchor():
     defect, _ = sv._classify(3.044444, 6.991781)
-    assert defect == "frequency"
+    assert defect == "period_anchor"
 
 
 def test_day_count_defect_detected_from_small_proportional_miss():
@@ -25,9 +31,9 @@ def test_day_count_defect_detected_from_small_proportional_miss():
     assert "1.0139" in why
 
 
-def test_odd_ratio_falls_through_to_schedule_or_coupon():
+def test_odd_ratio_falls_through_to_period_anchor():
     defect, _ = sv._classify(4.0, 5.6)
-    assert defect == "schedule_or_coupon"
+    assert defect == "period_anchor"
 
 
 def test_zero_trade_accrued_is_indeterminate_not_a_finding():
