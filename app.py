@@ -157,6 +157,58 @@ async def _recalc_stale_loop(interval_seconds: int):
 
 # ── Health + manifest ──────────────────────────────────────────────────────
 
+# Static-vs-trades validation is cached: it costs one GA10 call per trade and
+# the answer only changes when a trade is booked or static is corrected.
+# Refreshed on the schedule below and on demand via ?refresh=1.
+_static_val_cache: dict = {}
+_STATIC_VAL_TTL = 6 * 3600
+
+
+async def _static_validation(pid: str = "gdbft", refresh: bool = False) -> dict:
+    import time as _t
+    import static_validation
+    hit = _static_val_cache.get(pid)
+    if hit and not refresh and (_t.time() - hit[0]) < _STATIC_VAL_TTL:
+        return hit[1]
+    res = await static_validation.validate(pid)
+    # Only cache a run that actually completed — an outage must not stick.
+    if res.get("status") == "ok":
+        _static_val_cache[pid] = (_t.time(), res)
+    return res
+
+
+@app.get("/static/validate/{fund}")
+async def static_validate(request: Request, fund: str, refresh: bool = False):
+    """Every settled trade's accrued vs our static. Trades are the authority.
+
+    A difference here is a defect in OUR static — never in the confirm — and
+    it corrects static going forward only: settled values are frozen.
+    """
+    denied = await _aum_gate(request)
+    if denied:
+        return denied
+    pid = _funds.resolve(fund) or fund
+    return await _static_validation(pid, refresh)
+
+
+@app.get("/ops/probes")
+async def ops_probes():
+    """Dependency-aware health for the central control room (see
+    mcp_central/CLAUDE.md § Ops Visibility). Deliberately UNGATED, like
+    /health — the dashboard polls it without a session."""
+    import static_validation
+    probes = []
+    try:
+        probes.append(static_validation.probe(await _static_validation("gdbft")))
+    except Exception as e:
+        probes.append({"id": "static_vs_trades", "status": "red", "value": None,
+                       "expected": "check runs", "detail": str(e)})
+    order = {"red": 0, "amber": 1, "green": 2}
+    overall = min((p["status"] for p in probes),
+                  key=lambda s: order.get(s, 3), default="green")
+    return {"app": "recon-mcp", "overall": overall, "probes": probes}
+
+
 @app.get("/health")
 async def health():
     uptime = (datetime.utcnow() - _startup_time).total_seconds()
