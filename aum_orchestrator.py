@@ -33,6 +33,7 @@ import httpx
 import accrual_boundary
 import aum_passes
 import aum_recon
+import main_fund_breakdown
 import bond_recon
 import currency_hedge_recon
 import maia_evidence_report
@@ -645,6 +646,18 @@ async def build_aum_comparison(pid: str, date: str | None = None) -> dict:
     # at T+0 is the convention, not a break.
     result["accrued_recon"] = _accrued_recon(
         parsed, maia_rows_bonds, result.get("athena_marks") or {})
+
+    # ── MAIN-FUND AUM on GA10 accrual, every component as a % of it.
+    # Share-class overlay stripped (it belongs to the classes), per-bond
+    # accrued restated to GA10's C+1 calc, declared-but-unpaid income carried
+    # through untouched, and the Maia cash check stated rather than ticked.
+    try:
+        result["main_fund"] = main_fund_breakdown.build(
+            parsed, result.get("athena_marks") or {}, waystone, maia,
+            (result.get("accrued_recon") or {}).get("rows"))
+    except Exception as e:
+        logger.warning("aum: main-fund breakdown failed: %s", e, exc_info=True)
+        result["main_fund"] = {"error": str(e)}
 
     # ── MANAGEMENT ASSESSMENT — the punchy, honest headline. Never says
     # "agrees" while differences exist: every dollar of the stated gap is
