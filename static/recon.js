@@ -311,6 +311,83 @@
             totals W ${num((p.totals || {}).waystone)} / M ${num((p.totals || {}).maia)}</div>`;
     }
 
+    // Main fund AUM: administrator NAV less the share-class overlay, with the
+    // per-bond accrued restated to GA10's C+1 calc. The bridge is shown line
+    // by line so the reader can see WHERE the restatement moves the number,
+    // and the per-bond diffs are sorted biggest-first because a handful of
+    // bonds carry nearly all of it.
+    function renderMainFund(r) {
+        const m = r.main_fund;
+        if (!m || m.error || m.main_fund_aum == null) {
+            $('mainFund').innerHTML = '<div class="muted">'
+                + esc((m && m.error) || 'main fund breakdown unavailable')
+                + '</div>';
+            return;
+        }
+        const a = m.accrued || {};
+        const bridge = [
+            ['Administrator NAV', m.waystone_total_nav, ''],
+            ['less share-class hedge P&amp;L', m.share_class_hedge_pnl,
+             'overlay belongs to the hedged classes, not the fund'],
+            ['accrued restated to GA10 C+1', a.delta_vs_waystone,
+             'per-bond only — declared-but-unpaid income carried through'],
+            ['<b>MAIN FUND AUM</b>', m.main_fund_aum, ''],
+        ].map(([lbl, v, note], i, arr) => `<tr${i === arr.length - 1
+                ? ' style="border-top:2px solid var(--line)"' : ''}>
+                <td class="lbl">${lbl}${note
+                    ? `<span class="muted"> — ${note}</span>` : ''}</td>
+                <td style="text-align:right">${num(v)}</td></tr>`).join('');
+
+        const comp = (m.breakdown || []).map(b => `<tr>
+                <td class="lbl">${esc(b.label)}</td>
+                <td style="text-align:right">${num(b.value)}</td>
+                <td style="text-align:right">${b.pct_of_main_fund == null
+                    ? '' : num(b.pct_of_main_fund, 2) + '%'}</td></tr>`).join('');
+
+        // Only bonds GA10 actually restated carry a meaningful diff; the
+        // retained ones are shown too, flagged, so a partial restatement
+        // cannot read as a full one.
+        const diffs = (a.rows || []).filter(x => x.diff_base).slice(0, 12)
+            .map(x => `<tr><td class="lbl">${esc(x.isin)}
+                    <span class="muted">${esc((x.description || '').slice(0, 34))}</span></td>
+                <td>${num(x.waystone_accrued_base)}</td>
+                <td>${num(x.ga10_accrued_base)}</td>
+                ${diffCell(x.diff_base)}</tr>`).join('');
+
+        const c = m.cash_check || {};
+        $('mainFund').innerHTML =
+            `<div class="src" style="margin-bottom:8px">${esc(m.basis)}</div>
+             <div class="grid2">
+               <div><table>${bridge}</table></div>
+               <div><table><thead><tr><th>Component</th><th style="text-align:right">Value</th>
+                    <th style="text-align:right">% of main fund</th></tr></thead>
+                    <tbody>${comp}</tbody>
+                    <tfoot><tr><td class="lbl"><b>Total</b></td><td></td>
+                      <td style="text-align:right"><b>${num(m.breakdown_pct_total, 2)}%</b></td>
+                    </tr></tfoot></table></div>
+             </div>
+             <div class="src" style="margin-top:10px">Accrued: administrator
+                balance sheet ${num(a.waystone_balance_sheet)} = per-bond
+                ${num(a.waystone_per_bond_sum)} + declared-but-unpaid
+                ${num(a.declared_unpaid_income)}. GA10 C+1 restates the
+                per-bond part to ${num(a.ga10_c1_per_bond)}
+                (coverage ${esc(a.coverage)}${a.bonds_retained_at_waystone
+                    ? `, ${a.bonds_retained_at_waystone} retained at the
+                       administrator worth ${num(a.value_retained_at_waystone)}`
+                    : ''}).</div>
+             ${diffs ? `<h3 style="margin:12px 0 6px">Largest accrued differences</h3>
+             <div class="scroll"><table><thead><tr><th>Bond</th><th>Waystone</th>
+                <th>GA10 C+1</th><th>&Delta;</th></tr></thead>
+                <tbody>${diffs}</tbody></table></div>` : ''}
+             <div class="src" style="margin-top:10px"><b>Cash</b> — Maia
+                ${num(c.maia)} vs administrator ${num(c.waystone)},
+                difference ${num(c.difference)}${c.difference_pct_of_cash != null
+                    ? ` (${num(c.difference_pct_of_cash, 2)}% of cash)` : ''}.
+                ${esc(c.note || '')}</div>
+             ${(m.caveats || []).map(x =>
+                `<div class="src" style="margin-top:6px">! ${esc(x)}</div>`).join('')}`;
+    }
+
     function renderAccrued(r) {
         const ar = r.accrued_recon;
         if (!ar || !(ar.rows || []).length) {
@@ -497,6 +574,7 @@
             renderBriefing(r);
             renderVerdict(r); renderDateWarning(r); renderAum(r); renderEvidence(r);
             renderAttribution(r); renderBonds(r); renderPrices(r); renderAccrued(r);
+            renderMainFund(r);
             renderFx(r); renderCurrency(r);
             $('status').textContent = '';
             renderUploadHistory();
