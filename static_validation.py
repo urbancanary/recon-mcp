@@ -116,21 +116,64 @@ async def _orca_trades(pid: str) -> list[dict]:
             and t.get("accrued_interest") is not None]
 
 
-async def _ga10_accrued(isin: str, price: float, settle: str,
-                        api_key: str) -> dict | None:
-    """GA10 accrued per 100 at an explicit settlement date."""
+async def _ga10_accrued_batch(prices: dict, settle: str,
+                              api_key: str) -> dict:
+    """{isin: analytics} for a whole settlement date, via portfolio/analysis.
+
+    USE THIS ENDPOINT, NOT /api/v1/bond/analysis/flexible. Measured
+    2026-08-12: `flexible` returns day_count "Thirty360", frequency 2 and
+    coupon None for every bond — unconditionally, even when the correct
+    conventions are passed explicitly — so it silently ignores stored static
+    and manufactures disagreements that do not exist. An earlier version of
+    this module called it and produced ~51 findings that were artifacts of
+    its own engine call, not defects in the book.
+
+    portfolio/analysis, same host and same bonds, reproduces the settled
+    trade confirms to six decimal places:
+
+        Vodafone   XS2630493570   6.991781 vs confirm 6.991781
+        SW Finance XS2731297235   4.344178 vs confirm 4.344177
+        PIC        XS2819228664   4.558219 vs confirm 4.558219
+        Bund       DE0001030757   1.647123 vs confirm 1.647123
+
+    Batching by settlement date is also what makes this cheap: one call per
+    date instead of one per trade.
+    """
+    if not prices:
+        return {}
+    payload = {"format": "FLDS", "data": [
+        {"BOND_CD": i, "CLOSING PRICE": float(p), "WEIGHTING": 1.0,
+         "Inventory Date": settle.replace("-", "/")}
+        for i, p in prices.items()]}
     try:
-        async with httpx.AsyncClient(timeout=60.0) as c:
-            r = await c.post(
-                f"{_GAE_URL}/api/v1/bond/analysis/flexible",
-                json={"isin": isin, "price": price, "settlement_date": settle},
-                headers={"X-API-Key": api_key, "Content-Type": "application/json"})
-        if r.status_code != 200:
-            return None
-        return (r.json() or {}).get("analytics") or {}
+        async with httpx.AsyncClient(timeout=120.0) as c:
+            r = await c.post(f"{_GAE_URL}/api/v1/portfolio/analysis",
+                             json=payload,
+                             headers={"X-API-Key": api_key,
+                                      "Content-Type": "application/json"})
+        if r.status_code == 200:
+            return {b["isin"]: b for b in (r.json().get("bond_data") or [])
+                    if b.get("isin")}
     except Exception as e:
-        logger.warning("static-validation: GA10 failed %s @ %s: %s", isin, settle, e)
-        return None
+        logger.warning("static-validation: GA10 failed @ %s: %s", settle, e)
+        if len(prices) == 1:
+            return {}
+        r = None
+
+    # POISON BOND: the batch dies wholesale when ANY bond in it lacks
+    # reference data, so one bad ISIN blanks the whole settlement date —
+    # measured here as 31 of 60 trades going unchecked on two 500s. Split
+    # and recurse so every priceable bond still gets a mark and only the
+    # genuinely un-enrolled drop out. Same fix as aum_orchestrator._ga10_batch.
+    if len(prices) == 1:
+        logger.info("static-validation: GA10 cannot price %s @ %s",
+                    next(iter(prices)), settle)
+        return {}
+    items = list(prices.items())
+    mid = len(items) // 2
+    left = await _ga10_accrued_batch(dict(items[:mid]), settle, api_key)
+    right = await _ga10_accrued_batch(dict(items[mid:]), settle, api_key)
+    return {**left, **right}
 
 
 def _exception_for(isin: str, settle: str) -> str | None:
@@ -150,11 +193,22 @@ async def validate(pid: str = "gdbft") -> dict:
         return {"status": "error", "error": "GA10_API_KEY unavailable",
                 "portfolio_id": pid}
 
+    # One GA10 call per settlement date, not per trade.
+    by_settle: dict[str, dict] = {}
+    for t in trades:
+        by_settle.setdefault(str(t["settlement_date"])[:10], {})[t["isin"]] = \
+            float(t.get("price") or 100.0)
+    marks: dict[str, dict] = {}
+    for settle, prices in by_settle.items():
+        got = await _ga10_accrued_batch(prices, settle, api_key)
+        for isin, b in got.items():
+            marks[f"{isin}@{settle}"] = b
+
     findings, excepted, unchecked, ok = [], [], [], []
     for t in trades:
         isin, settle = t["isin"], str(t["settlement_date"])[:10]
         trade_acc = float(t["accrued_interest"])
-        a = await _ga10_accrued(isin, float(t.get("price") or 100.0), settle, api_key)
+        a = marks.get(f"{isin}@{settle}")
         g = (a or {}).get("accrued_interest")
         row = {
             "isin": isin, "description": t.get("description"),
