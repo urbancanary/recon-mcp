@@ -258,11 +258,101 @@ def parse_maia_tsv(tsv: str) -> tuple[list[dict], dict]:
 
 # ── Admin prices → bond-data ────────────────────────────────────────────────
 
+async def _calc_admin_analytics(prices: dict, price_date: str) -> dict:
+    """QuantLib analytics for admin prices, via GA10 /api/v1/portfolio/analysis.
+
+    `prices` is {isin: clean_price}. Returns {isin: {column: value}} ready to
+    merge onto the bond_analytics_dated row for `price_date`.
+
+    Settle convention: Inventory Date == price_date. That is what the whole
+    stored admin series was computed at — verified 2026-08-12 by replaying
+    GB00BBQ33664 at 2026/08/10 and getting back the stored row to 7 s.f.
+    (accrued 1.3760274, ytm 7.9290982, oad 12.4826249). The result lands in
+    `accrued_interest_c1`, which is where every prior admin row carries it.
+
+    Returns {} on failure — the caller logs loudly and still stores the price.
+    """
+    from auth_client import get_api_key
+
+    isins = [i for i, px in prices.items() if px is not None]
+    if not isins:
+        return {}
+
+    api_key = get_api_key("GA10_API_KEY", requester="recon-mcp")
+    if not api_key:
+        logger.error("GA10_API_KEY missing — admin prices will store without analytics")
+        return {}
+
+    GAE_URL = "https://future-footing-414610.uc.r.appspot.com"
+    inv_date = price_date.replace("-", "/")
+    out: dict = {}
+
+    # Chunked so one oversized admin file can't blow the request wall-clock.
+    CHUNK = 50
+    for start in range(0, len(isins), CHUNK):
+        chunk = isins[start:start + CHUNK]
+        payload = {
+            "format": "FLDS",
+            "data": [
+                {
+                    "BOND_CD": isin,
+                    "CLOSING PRICE": float(prices[isin]),
+                    "WEIGHTING": 1.0,
+                    "Inventory Date": inv_date,
+                }
+                for isin in chunk
+            ],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                r = await client.post(
+                    f"{GAE_URL}/api/v1/portfolio/analysis",
+                    json=payload,
+                    headers={"Content-Type": "application/json", "X-API-Key": api_key},
+                )
+            if r.status_code != 200:
+                logger.error(
+                    "Admin analytics: GA10 portfolio/analysis HTTP %s for %s (%d bonds): %s",
+                    r.status_code, price_date, len(chunk), r.text[:200],
+                )
+                continue
+            for b in (r.json().get("bond_data") or []):
+                if b.get("status") != "success":
+                    continue
+                isin = b.get("isin") or b.get("name")
+                ytm = b.get("ytm") if b.get("ytm") is not None else b.get("yield")
+                if not isin or ytm is None:
+                    continue
+                out[isin] = {
+                    "accrued_interest_c1": b.get("accrued_interest"),
+                    "yield_to_maturity": ytm,
+                    "modified_duration": b.get("duration"),
+                    "yield_convention": b.get("yield_convention") or "YTM",
+                }
+        except Exception as e:
+            logger.error(
+                "Admin analytics: GA10 call failed for %s (%d bonds): %r",
+                price_date, len(chunk), e,
+            )
+
+    return out
+
+
 async def _store_admin_prices_to_bond_data(admin_bonds: list[dict], price_date: str):
     """Write admin prices to bond_analytics_dated in bond-data Supabase.
 
     This gives Athena a price history even when CBonds/ETF scraper hasn't run.
     Source = 'admin'. Upserts by (isin, price_date, source).
+
+    The analytics are calculated in the SAME write as the price. A price-only
+    admin row is not an acceptable intermediate state: v_holdings_enriched
+    picks the latest price_date first, so a row with a price and a NULL
+    accrued wins the lateral and silently zeroes that position's accrued —
+    understating NAV with no error anywhere. That is exactly what happened to
+    GB00BBQ33664 on 2026-08-11. Nothing else re-drives these rows on arrival:
+    ga10-pricing's stageHistoryFill is the only backstop and it 500s outright
+    on any bond whose resolved issue_date is NULL (backlog: GA11 history
+    NULL-date crash), so "the hopper will catch it" is not a guarantee.
     """
     from recon_db import BOND_DATA_URL, _bond_data_headers
     rows = []
@@ -283,6 +373,36 @@ async def _store_admin_prices_to_bond_data(admin_bonds: list[dict], price_date: 
 
     if not rows:
         return
+
+    # Calculate before writing, so price and analytics land in one upsert.
+    analytics = await _calc_admin_analytics(
+        {r["isin"]: r["price"] for r in rows}, price_date
+    )
+    for r in rows:
+        r.update(analytics.get(r["isin"], {}))
+
+    missing = sorted(r["isin"] for r in rows if r["isin"] not in analytics)
+    if missing:
+        # Loud, never silent: these rows go in price-only and will read as a
+        # zero accrued until something recalcs them.
+        logger.error(
+            "Admin prices %s: %d/%d bonds got NO analytics from GA10 — "
+            "stored price-only, accrued will read as zero: %s",
+            price_date, len(missing), len(rows), ", ".join(missing[:20]),
+        )
+        try:
+            await alert_data_quality(
+                issue=(
+                    f"Admin price import {price_date}: GA10 returned no analytics, so "
+                    f"these rows stored price-only. Accrued reads as zero for these "
+                    f"positions until something recalcs them."
+                ),
+                table="bond_analytics_dated (source=admin)",
+                count=len(missing),
+                sample_isins=missing,
+            )
+        except Exception as e:
+            logger.warning(f"alert_data_quality failed: {e!r}")
 
     try:
         headers = {**_bond_data_headers(), "Prefer": "return=minimal,resolution=merge-duplicates"}
