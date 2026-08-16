@@ -283,7 +283,7 @@ async def _calc_admin_analytics(prices: dict, price_date: str) -> dict:
         logger.error("GA10_API_KEY missing — admin prices will store without analytics")
         return {}
 
-    GAE_URL = "https://future-footing-414610.uc.r.appspot.com"
+    ga10_url = _ga10_pricing()
     inv_date = price_date.replace("-", "/")
     out: dict = {}
 
@@ -306,7 +306,7 @@ async def _calc_admin_analytics(prices: dict, price_date: str) -> dict:
         try:
             async with httpx.AsyncClient(timeout=180.0) as client:
                 r = await client.post(
-                    f"{GAE_URL}/api/v1/portfolio/analysis",
+                    f"{ga10_url.rstrip('/')}/api/v1/portfolio/analysis",
                     json=payload,
                     headers={"Content-Type": "application/json", "X-API-Key": api_key},
                 )
