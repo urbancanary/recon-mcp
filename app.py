@@ -476,7 +476,13 @@ async def aum_funds_list():
     practice — Recon Report was offered only for a model portfolio that has no
     administrator, while the fund with a live feed could not reach it.
     """
-    return {"funds": aum_orchestrator.aum_funds()}
+    # `funds`, NOT aum_orchestrator: this is a static list off FUNDS, and the
+    # orchestrator was never imported in this handler (every other /aum route
+    # imports it locally), so the name was undefined and every call 500'd.
+    # Found 2026-08-13 by the Athena page audit — the 500 was silently gating
+    # whether the recon pages appeared in Athena's nav at all.
+    import funds as _funds_mod
+    return {"funds": _funds_mod.aum_funds()}
 
 
 @app.get("/aum/{fund}")
