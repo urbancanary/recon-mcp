@@ -388,6 +388,13 @@ async def build_aum_comparison(pid: str, date: str | None = None) -> dict:
     cand = [r for r in maia_reg if r.get("date") == anchor]
     cand.sort(key=lambda r: (r.get("date") or "", r.get("uploaded_at") or ""),
               reverse=True)
+    # EVERY same-date candidate is read, not just the winner: which file is
+    # read decides the verdict (31-Jul had a 13-col allocation view concluding
+    # -4.99% material and a full view concluding -0.30% agree on the SAME
+    # date). The winner is still the newest upload — capability ranking is
+    # backlog 2526 — but each candidate's own conclusion is carried out
+    # below so the choice is visible rather than silent.
+    candidate_summaries: list[dict] = []
     for row in cand:
         p = await _cached(row)
         if not p:
@@ -403,14 +410,20 @@ async def build_aum_comparison(pid: str, date: str | None = None) -> dict:
             maia_meta = {"available": False,
                          "error": f"{row.get('file_name')}: parsed 0 bonds"}
             continue
-        maia_breakdown = b
-        maia_date = row.get("date")
-        maia_path = p
-        maia_meta = {"available": True, "file": row.get("file_name"),
-                     "valuation_date": maia_date,
-                     "counts": b.get("counts"), "fx_rates": b.get("fx_rates")}
-        maia_rows_bonds = b.get("bond_rows") or []
-        break
+        candidate_summaries.append({
+            "file": row.get("file_name"),
+            "uploaded_at": row.get("uploaded_at"),
+            "total": b.get("total"),
+            "counts": b.get("counts"),
+        })
+        if maia_breakdown is None:
+            maia_breakdown = b
+            maia_date = row.get("date")
+            maia_path = p
+            maia_meta = {"available": True, "file": row.get("file_name"),
+                         "valuation_date": maia_date,
+                         "counts": b.get("counts"), "fx_rates": b.get("fx_rates")}
+            maia_rows_bonds = b.get("bond_rows") or []
 
     # ── Administrator pack: same date as the Maia view actually used, else
     # the newest on record (or the explicitly requested date).
@@ -460,6 +473,31 @@ async def build_aum_comparison(pid: str, date: str | None = None) -> dict:
         "dates_match": bool(maia_date and parsed.get("valuation_date") == maia_date),
         "maia_valuation_date": maia_date,
     })
+    # ── OTHER FILES FOR THIS DATE. The comparison above used ONE Maia export
+    # — the newest upload for the date (see the candidate loop). Each
+    # candidate's own stated total is set beside the administrator's NAV here,
+    # so a reader cannot take the verdict without the file that produced it.
+    # The selection itself is unchanged: newest-upload-wins, not capability-
+    # ranked (backlog 2526).
+    _cand_nav = ((parsed.get("summary") or {}).get("aum_breakdown") or {}).get("total_nav")
+    _sel_file = maia_meta.get("file") if maia_meta.get("available") else None
+    result["candidate_views"] = [
+        {
+            "file": cv["file"],
+            "uploaded_at": cv["uploaded_at"],
+            "bonds": (cv.get("counts") or {}).get("bonds"),
+            "total": cv["total"],
+            "difference": (None if (cv["total"] is None or not _cand_nav)
+                           else round(cv["total"] - _cand_nav, 2)),
+            "difference_pct": (None if (cv["total"] is None or not _cand_nav)
+                               else round((cv["total"] - _cand_nav) / _cand_nav * 100, 3)),
+            "material": (None if (cv["total"] is None or not _cand_nav)
+                         else abs((cv["total"] - _cand_nav) / _cand_nav * 100) > 1.0),
+            "selected": cv["file"] == _sel_file,
+        }
+        for cv in candidate_summaries
+    ]
+
     result["prices"] = nav_comparison.price_comparison(parsed, maia_rows_bonds)
 
     # ── Materiality verdict on the TOTALS (cash-based tests false-positive:

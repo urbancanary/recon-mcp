@@ -450,6 +450,7 @@
                 <td class="lbl">${esc(x.currency)}${x.currency === base
                     ? ' <span class="badge">base</span>' : ''}</td>
                 <td>${num(x.bonds_base)}</td>
+                <td>${num(x.accrued_base)}</td>
                 <td>${num(x.fund_forward_base)}</td>
                 <td>${num(x.share_class_forward_base)}</td>
                 <td>${num(x.net_fund_base)}</td>
@@ -457,6 +458,21 @@
                 <td class="${hot ? 'num-neg' : ''}">${x.pct_nav_all == null ? DASH
                     : num(x.pct_nav_all, 2) + '%'}</td></tr>`;
         }).join('');
+        // "Other files for this date" — one valuation date can carry several
+        // Maia exports whose stated totals disagree (31-Jul: a 13-col
+        // allocation view read -4.99% material while the full view read
+        // -0.30% agree). Each candidate's own conclusion is listed, so the
+        // verdict cannot be read without the file that produced it.
+        const cands = r.candidate_views || [];
+        const other = cands.length > 1
+            ? `<div class="src" style="margin-top:8px">Other files for this date: `
+              + cands.map(x => `${esc(x.file)} ${num(x.total)} `
+                  + `(${x.difference_pct == null ? DASH
+                      : (x.difference_pct > 0 ? '+' : '') + num(x.difference_pct, 2) + '%'}, `
+                  + `${x.material ? 'material' : 'agree'}`
+                  + `${x.selected ? ' — selected' : ''})`).join(' · ')
+              + `. Selection is newest-upload-wins, not capability-ranked.</div>`
+            : '';
         const sc = c.share_class_hedges || {};
         const cls = (sc.rows || []).map(x => `<tr>
             <td class="lbl">${esc(x.share_class)}</td>
@@ -470,9 +486,10 @@
         $('currency').innerHTML =
             (fx.alert ? `<div class="note err">&#9888; ${esc(fx.message)}</div>` : '')
             + (exp ? `<table style="margin-bottom:12px"><thead><tr><th>Ccy</th>
-                <th>Bonds</th><th>Fund fwd</th><th>Share-class fwd</th>
+                <th>Bonds</th><th>Accrued</th><th>Fund fwd</th><th>Share-class fwd</th>
                 <th>Net (fund)</th><th>%NAV fund</th><th>%NAV all-in</th></tr></thead>
                 <tbody>${exp}</tbody></table>` : '')
+            + other
             + (cls ? `<table><thead><tr><th>Share class</th><th>Ccy</th>
                 <th>Net assets (local)</th><th>Hedge notional</th><th>Hedged</th>
                 <th></th></tr></thead><tbody>${cls}</tbody></table>` : '')
