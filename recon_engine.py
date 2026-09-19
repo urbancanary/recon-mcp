@@ -267,8 +267,31 @@ async def _calc_admin_analytics(prices: dict, price_date: str) -> dict:
     Settle convention: Inventory Date == price_date. That is what the whole
     stored admin series was computed at — verified 2026-08-12 by replaying
     GB00BBQ33664 at 2026/08/10 and getting back the stored row to 7 s.f.
-    (accrued 1.3760274, ytm 7.9290982, oad 12.4826249). The result lands in
-    `accrued_interest_c1`, which is where every prior admin row carries it.
+    (accrued 1.3760274, ytm 7.9290982, oad 12.4826249).
+
+    Field mapping is the FLDS one, matching the BBG writer at
+    `recalc_with_bbg_prices` (backlog id=3604). GA10 FLDS field semantics:
+    `ytm` is the with-sinks IRR (= BBG's yield_to_worst for amortisers),
+    `ytal` is flip-nomenclature, `duration` is the oad. So:
+
+      accrued_interest     ← accrued_interest   (NOT accrued_interest_c1:
+                              the engine's own boundary check 2026-09-19
+                              replayed 2026/08/10 and matched the stored
+                              row, which carries its accrued in the c1 column)
+      yield_to_maturity    ← ytm
+      yield_to_worst       ← ytw or ytm         (BBG-comparable comparator)
+      modified_duration    ← duration
+      duration_worst       ← duration_worst or duration
+      ga10_ytal            ← ytal               (diagnostic only)
+      accrual_date         ← accrual_date / last_coupon_date, else the
+                              coupon-period start from bond_cashflow_schedule
+
+    `accrual_date` on bond_analytics_dated is NOT decoration. Every other
+    writer fills it and the engine enforces
+    `BETWEEN accrual_period_start AND accrual_period_end` on the COALESCE of
+    the four accrued columns, so a NULL start silently drops the row from
+    that query however good the accrued is. Resolving it here is what keeps
+    this one self-contained rather than depending on a later recompute.
 
     Returns {} on failure — the caller logs loudly and still stores the price.
     """
@@ -286,6 +309,36 @@ async def _calc_admin_analytics(prices: dict, price_date: str) -> dict:
     GAE_URL = "https://future-footing-414610.uc.r.appspot.com"
     inv_date = price_date.replace("-", "/")
     out: dict = {}
+
+    async def _accrual_starts() -> dict:
+        # {isin: accrual_period_start}: the coupon period containing price_date,
+        # from bond_cashflow_schedule (bond-data project, CBonds-fed). Same
+        # lookup the BBG path uses, same ISO date the other writers store.
+        try:
+            isin_filter = ",".join(isins)
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(
+                    f"{BOND_DATA_URL}/rest/v1/bond_cashflow_schedule",
+                    headers=_bond_data_headers(),
+                    params={
+                        "isin": f"in.({isin_filter})",
+                        "start_date": f"lte.{price_date}",
+                        "date": f"gt.{price_date}",
+                        "select": "isin,start_date,date",
+                    },
+                )
+            if r.status_code != 200:
+                logger.warning(
+                    "Admin analytics: cashflow_schedule fetch -> %s: %s",
+                    r.status_code, r.text[:200],
+                )
+                return {}
+            return {row["isin"]: row["start_date"] for row in r.json() if row.get("isin")}
+        except Exception as e:
+            logger.warning(f"Admin analytics: cashflow_schedule fetch failed: {e!r}")
+            return {}
+
+    accrual_starts = await _accrual_starts()
 
     # Chunked so one oversized admin file can't blow the request wall-clock.
     CHUNK = 50
@@ -323,11 +376,20 @@ async def _calc_admin_analytics(prices: dict, price_date: str) -> dict:
                 ytm = b.get("ytm") if b.get("ytm") is not None else b.get("yield")
                 if not isin or ytm is None:
                     continue
+                base = b.get("duration") or b.get("modified_duration")
                 out[isin] = {
-                    "accrued_interest_c1": b.get("accrued_interest"),
+                    "accrued_interest": b.get("accrued_interest"),
                     "yield_to_maturity": ytm,
-                    "modified_duration": b.get("duration"),
+                    "yield_to_worst": b.get("ytw") or ytm,
+                    "modified_duration": base,
+                    "duration_worst": b.get("duration_worst") or base,
+                    "ga10_ytal": b.get("ytal"),
                     "yield_convention": b.get("yield_convention") or "YTM",
+                    "accrual_date": (
+                        b.get("accrual_date")
+                        or b.get("last_coupon_date")
+                        or accrual_starts.get(isin)
+                    ),
                 }
         except Exception as e:
             logger.error(
