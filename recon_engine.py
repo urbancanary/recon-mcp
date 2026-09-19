@@ -654,8 +654,15 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
 
     Two parallel batched calls, one per settle date (T+0 and C+1 = price_date + 1
     calendar day). Each call returns full analytics for every bond in the batch.
-    No Cloudflare Workers, no fan-out, no retry loop — a single round-trip per
-    settle date direct to GAE.
+    No Cloudflare Workers, no retry loop — a single round-trip per settle date
+    direct to GAE.
+
+    Then ONE fan-out of per-bond /api/v1/bond/analysis calls (no overrides, or a
+    call override for callables) to pick up what the FLDS batch omits: separate
+    ytm/ytw, convexity, pvbp, dirty_price, accrued_days, ytal/is_amortizing.
+    Those land in their own columns; they do not replace the comparator fields
+    the recon view reads. Cost: ~26 calls, 1-3s warm each, bounded by one
+    timeout — adds ~5-10s to a recalc that currently runs ~36s.
 
     Stamps each recon_calcs row with provenance hashes (static + price). Engine
     IDs default to None now that we bypass the Worker layer.
@@ -781,40 +788,74 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
         logger.error("GA10 portfolio/analysis call failed: %r", e)
         return 0
 
-    # For each callable bond, hit /api/v1/bond/analysis with explicit
-    # overrides so GA10 actually prices the call (FLDS batch ignores
-    # per-row overrides). Default call_price=100 — par calls are the
-    # common case; if a bond ever has a premium call, extend later.
+    # Second fan-out: per-bond /api/v1/bond/analysis for the *whole* book. The
+    # callable bonds get explicit call overrides (the FLDS batch ignores
+    # per-row overrides) so GA10 actually prices the call; everything else is
+    # called plain.
+    #
+    # The batched FLDS path above returns accrued / yield / duration /
+    # spread only; this single-bond endpoint is the one that returns the split
+    # analytics the recon was missing — ytm AND ytw as separate fields,
+    # convexity, pvbp, dirty_price, accrued_days, ytal/is_amortizing/wal_date
+    # and the conventions block.
+    #
+    # Nothing here overwrites a comparator: the fan-out lands in its own
+    # recon_calcs columns (ga10_ytw_explicit, ga10_dirty_price, ga10_accrued_days,
+    # ga10_is_amortizing, ga10_amortizing_yield) and its own athena_bbg columns
+    # (dirty_price). ga10_yield_worst keeps its meaning — "the yield to compare
+    # against BBG YTW". Reconciling the two per-bond yields is a decision, not a
+    # calculation: see v_athena_bbg_yield_diag in
+    # sql/007_recon_diagnostic_analytics.sql.
+    #
+    # ~26 bonds in parallel, 1-3s warm each; bounded by one timeout, not 26.
+    a_analysis: dict[str, dict] = {}
     callable_ytw: dict[str, float] = {}
-    if call_dates:
-        async def _ytw_with_call(isin: str, call_date: str):
-            try:
-                payload = {
-                    "isin": isin,
-                    "price": float(bbg_prices.get(isin)),
-                    "settlement_date": settle_t0,
-                    "overrides": {"call_date": call_date, "call_price": 100},
-                }
-                async with httpx.AsyncClient(timeout=30.0) as c:
-                    r = await c.post(
-                        f"{GAE_URL}/api/v1/bond/analysis",
-                        json=payload,
-                        headers={"Content-Type": "application/json", "X-API-Key": api_key},
-                    )
-                if r.status_code != 200:
-                    logger.warning(f"bond/analysis call-override {isin}: HTTP {r.status_code}")
-                    return isin, None
-                analytics = (r.json() or {}).get("analytics") or {}
-                return isin, analytics.get("ytw")
-            except Exception as e:
-                logger.warning(f"bond/analysis call-override {isin}: {e!r}")
-                return isin, None
 
-        results = await asyncio.gather(*[_ytw_with_call(i, d) for i, d in call_dates.items()])
-        for isin, ytw in results:
-            if ytw is not None:
-                callable_ytw[isin] = ytw
-        logger.info(f"call-override fan-out: {len(callable_ytw)}/{len(call_dates)} callable bonds priced")
+    async def _bond_analysis(isin: str):
+        px = bbg_prices.get(isin)
+        if px is None:
+            return isin, None
+        try:
+            payload = {
+                "isin": isin,
+                "price": float(px),
+                "settlement_date": settle_t0,
+            }
+            call_date = call_dates.get(isin)
+            expected_ytw = None
+            if call_date:
+                # Callables: price the call too, so this call both supplies the
+                # comparator override and the diagnostic split in one round-trip.
+                payload["overrides"] = {"call_date": call_date, "call_price": 100}
+                # Default call_price=100 — par calls are the common case; if a
+                # bond ever has a premium call, extend later.
+                expected_ytw = True
+            async with httpx.AsyncClient(timeout=30.0) as c:
+                r = await c.post(
+                    f"{GAE_URL}/api/v1/bond/analysis",
+                    json=payload,
+                    headers={"Content-Type": "application/json", "X-API-Key": api_key},
+                )
+            if r.status_code != 200:
+                logger.warning(f"bond/analysis {isin}: HTTP {r.status_code}")
+                return isin, None
+            analytics = (r.json() or {}).get("analytics") or {}
+            return isin, {"a": analytics, "call_override": expected_ytw}
+        except Exception as e:
+            logger.warning(f"bond/analysis {isin}: {e!r}")
+            return isin, None
+
+    results = await asyncio.gather(*[_bond_analysis(i) for i in isins])
+    for isin, got in results:
+        if not got:
+            continue
+        a_analysis[isin] = got["a"]
+        if got["call_override"] and got["a"].get("ytw") is not None:
+            callable_ytw[isin] = got["a"]["ytw"]
+    logger.info(
+        f"bond/analysis fan-out: {len(a_analysis)}/{len(isins)} bonds enriched, "
+        f"{len(callable_ytw)}/{len(call_dates)} callable bonds priced at the call"
+    )
 
     t0_bonds = {b.get("isin"): b for b in (t0_resp.get("bond_data") or []) if b.get("isin")}
     c1_bonds = {b.get("isin"): b for b in (c1_resp.get("bond_data") or []) if b.get("isin")}
@@ -880,6 +921,32 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
         yield_convention = t0.get("yield_convention")
         if isin in callable_ytw:
             yield_convention = "YTW"
+
+        # Diagnostic split from the per-bond fan-out. `d` is per-100, same basis
+        # as t0/c1. Fields absent from the response stay None — never defaulted,
+        # because a zero on this page is a claim.
+        d = a_analysis.get(isin) or {}
+        d_conv = d.get("conventions") or {}
+        is_amortizing = d.get("is_amortizing")
+        # GA10's convention-aware pick, when it tells us explicitly. Used only
+        # to LABEL the row; the comparator itself is unchanged.
+        d_conv_yield = None
+        if is_amortizing is True:
+            d_conv_yield = d.get("ytal")
+        elif is_amortizing is False:
+            d_conv_yield = d.get("ytm")
+        if d_conv_yield is None:
+            d_conv_yield = d.get("ytm")
+        # How far the comparator we compare against BBG sits from GA10's own
+        # ytw for the same bond/price/settle. Non-zero only where a convention
+        # genuinely differs; surfaced so the difference can be looked at rather
+        # than absorbed silently.
+        ytw_explicit = d.get("ytw")
+        if ytw_explicit is not None and ytw_value is not None:
+            ytw_delta = (ytw_value - ytw_explicit) * 100.0
+        else:
+            ytw_delta = None
+
         calcs.append({
             "isin": isin,
             "source_price": bbg_prices.get(isin),
@@ -902,6 +969,14 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
             "convention_used":  t0.get("day_count"),
             "last_coupon_date": last_coupon,
             "issue_date":       None,
+            # ── Per-bond fan-out: the fields the FLDS batch doesn't return ──
+            "ga10_ytw_explicit":    ytw_explicit,
+            "ga10_amortizing_yield": d_conv_yield,
+            "ga10_dirty_price":     d.get("dirty_price"),
+            "ga10_accrued_days":    d.get("accrued_days"),
+            "ga10_is_amortizing":   is_amortizing,
+            "ga10_ytw_delta_bps":   ytw_delta,
+            "convention_used_detail": d_conv.get("day_count") or d.get("day_count"),
             # Provenance — drives v_stale_calcs / drift chip
             "calc_static_hash": static_hash_by_isin.get(isin),
             "calc_price_hash":  compute_price_hash(
@@ -928,6 +1003,11 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
                 "day_count": t0.get("day_count"),
                 "last_coupon_date": last_coupon,
                 "days_accrued": days_accrued,
+                # Per-100, NOT par-scaled: this is a price, and athena_bbg's
+                # other price-bearing columns are per-100 clean. Do not fold it
+                # into accrued_* — that series is frozen and BBG-comparable.
+                "dirty_price":    d.get("dirty_price"),
+                "dirty_price_c1": a_analysis.get(isin, {}).get("dirty_price_c1"),
             })
 
     if calcs:
