@@ -721,6 +721,11 @@ async def store_athena_bbg(portfolio_id: str, date: str, rows: list[dict]) -> in
 
     Row fields: isin, par, source_price, accrued_t0, accrued_c1, accrued_t1,
     accrued_c2, accrued_c3, day_count, last_coupon_date, days_accrued.
+
+    Dirty price (per-100 clean + accrued, as GA10 returns it) is carried on
+    `dirty_price` / `dirty_price_c1` where the caller can supply it — see
+    sql/007_recon_diagnostic_analytics.sql. Body accrual columns (accrued_*)
+    remain the frozen, BBG-comparable series: do not fold dirty price into them.
     """
     new_isins = {r.get("isin") for r in rows if r.get("isin")}
     if new_isins:
@@ -740,6 +745,8 @@ async def store_athena_bbg(portfolio_id: str, date: str, rows: list[dict]) -> in
         "day_count": r.get("day_count"),
         "last_coupon_date": r.get("last_coupon_date"),
         "days_accrued": r.get("days_accrued"),
+        "dirty_price": r.get("dirty_price"),
+        "dirty_price_c1": r.get("dirty_price_c1"),
         "updated_at": now,
     } for r in rows]
     return await _upsert("athena_bbg", upsert_rows, "portfolio_id,date,isin")
@@ -751,6 +758,12 @@ async def store_calcs(portfolio_id: str, date: str, calcs: list[dict]) -> int:
     Provenance columns (calc_static_hash, calc_price_hash, calc_engine_pricing_id,
     calc_engine_gateway_id, calculated_at) are populated when the caller
     supplies them; they drive v_stale_calcs in sql/005_calc_staleness_hashes.sql.
+
+    `ga10_ytw_explicit` is GA10's own `analytics.ytw` — distinct from
+    `ga10_yield_worst`, which is the *comparator* the recon view uses (FLDS
+    convention-aware `yield`, or a call-override YTW for callables). Where they
+    disagree, the difference is a convention fact worth seeing, not a bug: see
+    sql/007_recon_diagnostic_analytics.sql and v_athena_bbg_yield_diag.
     """
     rows = [{
         "portfolio_id": portfolio_id,
@@ -768,6 +781,7 @@ async def store_calcs(portfolio_id: str, date: str, calcs: list[dict]) -> int:
         "ga10_yield_worst": c.get("ga10_yield_worst"),
         "ga10_ytal": c.get("ga10_ytal"),
         "ga10_yield_convention": c.get("ga10_yield_convention"),
+        "ga10_ytw_explicit": c.get("ga10_ytw_explicit"),
         "ga10_duration": c.get("ga10_duration"),
         "ga10_duration_worst": c.get("ga10_duration_worst"),
         "ga10_spread": c.get("ga10_spread"),
