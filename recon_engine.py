@@ -1505,6 +1505,7 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
             source="bbg", portfolio_id=pid, date=bbg_date,
             file_bytes=file_bytes, filename=filename,
             uploaded_by=uploaded_by, bonds_parsed=len(bbg_bonds),
+            coverage=bbg_result.get("parse_coverage"),
         ),
     )
 
@@ -1578,6 +1579,7 @@ async def process_admin_upload(file_bytes: bytes, filename: str, uploaded_by: st
             source="admin", portfolio_id=admin_pid, date=admin_date,
             file_bytes=file_bytes, filename=filename,
             uploaded_by=uploaded_by, bonds_parsed=len(admin_bonds),
+            coverage=result.get("parse_coverage"),
         ),
         aum_orchestrator.ingest_admin_payload(admin_pid, result),
     )

@@ -220,6 +220,23 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
 
         logger.info("BBG columns detected: %s → col_map: %s", [str(c) for c in df.columns], col_map)
 
+        # Columns this export does not carry. The per-column readers below all
+        # swallow ValueError/TypeError, so a column that is missing, or present
+        # in a shape not matched above, costs that field per bond and is
+        # reported nowhere — the same blind spot nav_parser's parse_coverage
+        # closes for the admin report. Optional columns only: isin and accrued
+        # are already fatal below. Keyed off the column LIST, not an amount.
+        _coverage = [
+            {"section": "columns", "detail": f"BBG column '{c}' not detected "
+             f"in {len(df.columns)} columns — {c} comes back None for every bond",
+             "count": None}
+            for c in ("ytm", "ytw", "mod_dur", "oad", "mv", "position",
+                      "issue_date", "maturity_date", "coupon", "cpn_rate",
+                      "cpn_freq", "day_count", "eff_maturity", "first_coupon",
+                      "accrued_pct", "moodys", "sp", "fitch", "bb_comp")
+            if c not in col_map
+        ]
+
         if 'isin' not in col_map:
             raise ValueError(f"No ISIN column found. Columns: {list(df.columns)}")
         if 'accrued' not in col_map:
@@ -597,6 +614,9 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
             "as_of_date": as_of_date,
             "settle_date": settle_date,
             "base_currency": base_currency,
+            # Columns this export did not carry — empty means every column the
+            # parser knows how to read was present. Never parsed from the file.
+            "parse_coverage": _coverage,
         }
 
     except Exception as e:
