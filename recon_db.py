@@ -14,7 +14,7 @@ import os
 import asyncio
 import logging
 import httpx
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -177,17 +177,27 @@ REFERENCE_CALC_FIELDS = ("coupon", "maturity_date", "day_count", "frequency", "a
 
 
 def overlay_canonical_static(row: dict, static_by_isin: dict, fields) -> dict:
-    """Replace a mirrored row's calc fields with the canonical view's values.
+    """Take a mirrored row's calc fields from the canonical view — or drop them.
 
-    A bond the view does not return keeps its row unchanged: the view is the
-    contract, but a mirror row is not dropped on a transient read gap.
+    A calc field is *replaced* by the view's value, and when the view carries
+    no value for that field the key is **removed** rather than left holding the
+    base table's. Leaving it would keep a second copy of a calc input in the
+    local mirror, which is the defect this overlay exists to close: the local
+    row is the fallback source the recon views COALESCE against, so a stale
+    base-table coupon sitting there is still priced on.
+
+    A bond the view does not return at all keeps its row untouched: the view is
+    the contract, but a mirror row is not dropped on a transient read gap.
     """
     s = static_by_isin.get(row.get("isin"))
     if not s:
         return row
     out = dict(row)
     for f in fields:
-        out[f] = s.get(f)
+        if s.get(f) is None:
+            out.pop(f, None)
+        else:
+            out[f] = s[f]
     return out
 
 
@@ -319,6 +329,146 @@ async def sync_bond_data(isins: list[str] = None) -> dict:
     return counts
 
 
+async def _patch(table: str, isin: str, payload: dict) -> int:
+    """PATCH one local row by ISIN. Returns 1 on success, 0 otherwise."""
+    if not payload:
+        return 0
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.patch(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers={**_headers(), "Prefer": "return=minimal"},
+            params={"isin": f"eq.{isin}"},
+            json=payload,
+        )
+        if r.status_code not in (200, 204):
+            logger.warning("%s PATCH failed for %s: %s %s", table, isin, r.status_code, r.text[:200])
+            return 0
+        return 1
+
+
+#: The canonical static-correction path, owned by bond_data_mcp. Findings go
+#: here; corrections come back only for values that disagree with the view.
+STATIC_CORRECTIONS_PATH = "/tools/static_corrections"
+
+
+def _bond_data_service_url() -> str:
+    """bond-data service base URL, lazily: env override → auth-mcp.
+
+    Same resolution order as BOND_DATA_URL's siblings; kept local so the
+    handoff does not add a second import-time failure mode to recon_db.
+    """
+    env = os.environ.get("BOND_DATA_MCP_URL")
+    if env:
+        return env.rstrip("/")
+    try:
+        from auth_client import get_service_url
+        return get_service_url("bond_data_mcp").rstrip("/")
+    except Exception:
+        return ""
+
+
+async def offer_static_corrections(findings: list[dict], timeout: float = 20) -> dict:
+    """Offer parsed static as evidence; apply only what comes back as a correction.
+
+    Backlog 5047: recon-mcp must not keep a local copy of the calc static
+    (coupon / maturity_date / day_count / frequency) and must not overwrite one.
+    This is the write-free half of that contract — it posts findings and returns
+    bond_data_mcp's answer unchanged, never touching a local row.
+
+    On any failure the answer is ``status="unavailable"`` with **no**
+    corrections. That is deliberate and it is the whole point: a producer that
+    cannot reach the canonical path must not fall back to its own copy of the
+    static, because a local copy is exactly how the two sources came to
+    disagree. Callers report the status; none of them change a number on a miss.
+    """
+    if not findings:
+        return {"status": "no_findings", "corrections": [], "drift": []}
+
+    base = _bond_data_service_url()
+    if not base:
+        return {
+            "status": "unavailable",
+            "reason": "bond-data service URL unavailable (auth-mcp); no local fallback taken",
+            "corrections": [], "drift": [],
+        }
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                f"{base}{STATIC_CORRECTIONS_PATH}",
+                headers={**_bond_data_headers(), "Content-Type": "application/json"},
+                json={"findings": findings},
+            )
+    except Exception as e:
+        logger.error("static_corrections unreachable (%s); no local fallback taken", e)
+        return {
+            "status": "unavailable",
+            "reason": f"{type(e).__name__}: {e}",
+            "corrections": [], "drift": [],
+        }
+
+    if resp.status_code != 200:
+        logger.warning(
+            "static_corrections returned %s (%s); no corrections applied",
+            resp.status_code, resp.text[:200],
+        )
+        return {
+            "status": "unavailable",
+            "reason": f"HTTP {resp.status_code}",
+            "corrections": [], "drift": [],
+        }
+
+    body = resp.json()
+    if body.get("status") != "ok":
+        # The endpoint says so itself when v_bond_static could not be read: a
+        # producer must not price on its own copy in that case.
+        logger.warning("static_corrections status=%s: %s", body.get("status"), body.get("error"))
+        return {
+            "status": "unavailable",
+            "reason": body.get("error") or body.get("status"),
+            "corrections": [], "drift": [],
+        }
+
+    return {
+        "status": "ok",
+        "source": body.get("source"),
+        "current_static": body.get("current_static") or {},
+        "corrections": body.get("corrections") or [],
+        "drift": body.get("drift") or [],
+        "reported": body.get("reported") or [],
+        "unmatched_isins": body.get("unmatched_isins") or [],
+    }
+
+
+async def _apply_offered_corrections(corrections: list[dict]) -> int:
+    """Write bond_data_mcp's OWN corrections back onto the local mirror.
+
+    The mirror's calc fields are read from v_bond_static (``sync_bond_data``),
+    so this is a convergence step, not a source: it touches only the rows and
+    fields the canonical path just named, and only values it returned. A
+    correction is never *not* written here — the guarded UPDATE that moves the
+    row for every engine is bond_data_mcp's migrations/005, and no lane may
+    apply that.
+    """
+    if not corrections:
+        return 0
+    by_isin: dict[str, dict] = {}
+    for row in corrections:
+        isin, field, value = row.get("isin"), row.get("field"), row.get("observed_value")
+        if isin and field in REFERENCE_CALC_FIELDS and value is not None:
+            by_isin.setdefault(isin, {})[field] = value
+    if not by_isin:
+        return 0
+    try:
+        _ensure_key()
+        writes = [_patch("local_bond_reference", isin, patch) for isin, patch in by_isin.items()]
+        results = await asyncio.gather(*writes, return_exceptions=True)
+        return sum(1 for r in results if r and not isinstance(r, Exception))
+    except Exception as e:
+        logger.error("applying offered corrections failed: %r", e)
+        return 0
+
+
 async def enrich_bond_data_from_bbg(
     maturity_date_bonds: dict,
     coupon_bonds: dict,
@@ -327,8 +477,7 @@ async def enrich_bond_data_from_bbg(
     eff_maturity_bonds: dict | None = None,
     first_coupon_bonds: dict | None = None,
 ) -> dict:
-    """Backfill local_bond_identity and local_bond_reference with BBG-parsed data.
-    Respects the `locked` flag on local_bond_reference.
+    """Offer BBG-parsed static to the canonical path; never overwrite the mirror.
 
     maturity_date_bonds: {isin: 'YYYY-MM-DD'} from Long Name parsing
     coupon_bonds: {isin: float} from Long Name parsing
@@ -337,72 +486,34 @@ async def enrich_bond_data_from_bbg(
     eff_maturity_bonds: {isin: 'YYYY-MM-DD'} exact BBG maturity (preferred over maturity_date_bonds)
     first_coupon_bonds: {isin: 'YYYY-MM-DD'}
 
-    BBG is authoritative for maturity_date, frequency, and day_count — always overwrites unlocked rows.
-    Coupon is only filled if currently NULL.
+    What BBG told us is **evidence**, not a write (backlog 5047, handed over
+    by bond_data_mcp). It goes to POST /tools/static_corrections as `findings`,
+    with the file and date it was read from; a calc field moves only if that
+    path returns it in `corrections`, which is restricted to values that
+    disagree with v_bond_static and are not contradicted by our own store. The
+    local tables are no longer written here at all: overwriting them is how
+    recon came to price on static that differs from every other engine, and the
+    guarded UPDATE on the bond-data side is the one place a calc field moves.
     """
     all_isins = list(set(
         list(maturity_date_bonds.keys()) + list(coupon_bonds.keys()) +
         list((eff_maturity_bonds or {}).keys()) + list((cpn_freq_bonds or {}).keys())
     ))
     if not all_isins:
-        return {"enriched_identity": 0, "enriched_reference": 0}
+        return {"enriched": 0, "corrections_offered": 0, "drift": 0,
+                "status": "no_findings", "isins": 0}
 
-    isin_filter = ",".join(all_isins)
-    _ensure_key()
-    enriched_identity = 0
-    enriched_reference = 0
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        # Fetch current local_bond_identity values
-        id_resp, ref_resp = await asyncio.gather(
-            client.get(
-                f"{SUPABASE_URL}/rest/v1/local_bond_identity",
-                headers=_headers(),
-                params={"isin": f"in.({isin_filter})", "select": "isin,maturity_date,coupon"},
-            ),
-            client.get(
-                f"{SUPABASE_URL}/rest/v1/local_bond_reference",
-                headers=_headers(),
-                params={"isin": f"in.({isin_filter})", "select": "isin,maturity_date,coupon,frequency,day_count,locked"},
-            ),
-        )
-
-    existing_id = {}
-    if not isinstance(id_resp, Exception) and id_resp.status_code == 200:
-        for r in id_resp.json():
-            existing_id[r["isin"]] = r
-
-    existing_ref = {}
-    if not isinstance(ref_resp, Exception) and ref_resp.status_code == 200:
-        for r in ref_resp.json():
-            existing_ref[r["isin"]] = r
-
-    import asyncio as _asyncio
-    patch_tasks = []
-
-    async def _patch(table: str, isin: str, payload: dict):
-        if not payload:
-            return 0
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.patch(
-                f"{SUPABASE_URL}/rest/v1/{table}",
-                headers={**_headers(), "Prefer": "return=minimal"},
-                params={"isin": f"eq.{isin}"},
-                json=payload,
-            )
-            if r.status_code not in (200, 204):
-                logger.warning("%s PATCH failed for %s: %s %s", table, isin, r.status_code, r.text[:200])
-                return 0
-            return 1
-
+    findings = []
     for isin in all_isins:
-        mat = maturity_date_bonds.get(isin)
+        # Prefer eff_maturity (exact BBG date) over maturity_date_bonds (regex
+        # from Long Name) — the same preference the local writer used to apply.
+        effective_mat = (eff_maturity_bonds or {}).get(isin) or maturity_date_bonds.get(isin)
         coup = coupon_bonds.get(isin)
 
-        # Prefer eff_maturity (exact BBG date) over maturity_date_bonds (regex from Long Name)
-        effective_mat = (eff_maturity_bonds or {}).get(isin) or mat
-
-        # Frequency conversion
+        # Frequency conversion: the words the view holds, from the raw spelling
+        # BBG gave us. The canonical normalizer also accepts the raw form, but
+        # sending the canonical one keeps `observed_value` readable to a human
+        # reviewing the offered correction.
         freq_raw = (cpn_freq_bonds or {}).get(isin)
         freq_str = None
         if freq_raw is not None:
@@ -413,53 +524,43 @@ async def enrich_bond_data_from_bbg(
             elif str(freq_raw) in ('4', 'Quarterly', 'QUARTERLY', 'Q'):
                 freq_str = 'Quarterly'
 
-        day_count_val = (day_count_bonds or {}).get(isin)
+        observed = {
+            "maturity_date": effective_mat,
+            "coupon": coup,
+            "frequency": freq_str,
+            "day_count": (day_count_bonds or {}).get(isin),
+        }
+        for field, value in observed.items():
+            if value is None:
+                continue  # a blank is not evidence that the view is wrong
+            findings.append({
+                "isin": isin,
+                "field": field,
+                "value": value,
+                "source": "BBG upload (recon-mcp enrich_bond_data_from_bbg)",
+                "evidence": (
+                    "Bloomberg file parsed for maturity/coupon/frequency/"
+                    "day_count; offered, never written to the local mirror"
+                ),
+                "observed_at": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            })
 
-        # local_bond_identity — update NULL fields, no locked check
-        cur_id = existing_id.get(isin, {})
-        id_patch = {}
-        if effective_mat and not cur_id.get("maturity_date"):
-            id_patch["maturity_date"] = effective_mat
-        if coup is not None and cur_id.get("coupon") is None:
-            id_patch["coupon"] = coup
-        if id_patch:
-            id_patch["synced_at"] = "now()"
-            if isin not in existing_id:
-                id_patch["isin"] = isin
-                patch_tasks.append(_upsert("local_bond_identity", [id_patch], "isin"))
-            else:
-                patch_tasks.append(_patch("local_bond_identity", isin, id_patch))
-
-        # local_bond_reference — BBG is authoritative for maturity/frequency/day_count on unlocked rows
-        cur_ref = existing_ref.get(isin, {})
-        if cur_ref.get("locked"):
-            continue
-        ref_patch = {}
-        # ALWAYS overwrite maturity_date with BBG value (more accurate than CBonds)
-        if effective_mat:
-            ref_patch["maturity_date"] = effective_mat
-        # ALWAYS overwrite frequency with BBG value (authoritative)
-        if freq_str is not None:
-            ref_patch["frequency"] = freq_str
-        # ALWAYS overwrite day_count with BBG value (authoritative)
-        if day_count_val is not None:
-            ref_patch["day_count"] = day_count_val
-        if ref_patch:
-            ref_patch["synced_at"] = "now()"
-            if isin not in existing_ref:
-                ref_patch["isin"] = isin
-                patch_tasks.append(_upsert("local_bond_reference", [ref_patch], "isin"))
-            else:
-                patch_tasks.append(_patch("local_bond_reference", isin, ref_patch))
-
-    if patch_tasks:
-        results = await _asyncio.gather(*patch_tasks, return_exceptions=True)
-        enriched = sum(1 for r in results if r and not isinstance(r, Exception))
-        logger.info("enrich_bond_data_from_bbg: %d patches applied for %d ISINs", enriched, len(all_isins))
-        return {"enriched": enriched, "isins": len(all_isins)}
-
-    logger.info("enrich_bond_data_from_bbg: nothing to enrich (all fields already populated)")
-    return {"enriched": 0, "isins": len(all_isins)}
+    offered = await offer_static_corrections(findings)
+    applied = await _apply_offered_corrections(offered.get("corrections") or [])
+    logger.info(
+        "enrich_bond_data_from_bbg: %d finding(s) for %d ISINs offered, "
+        "%d correction(s), %d drift, status=%s (no local write)",
+        len(findings), len(all_isins),
+        len(offered.get("corrections") or []), len(offered.get("drift") or []),
+        offered.get("status"),
+    )
+    return {
+        "enriched": applied,                # only ever bond_data_mcp's own corrections
+        "corrections_offered": len(offered.get("corrections") or []),
+        "drift": len(offered.get("drift") or []),
+        "status": offered.get("status"),
+        "isins": len(all_isins),
+    }
 
 
 # ── Storage: upload raw files + track metadata ─────────────────────────────
