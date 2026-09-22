@@ -27,7 +27,11 @@ FUNDS = {
         "name": "Guinness China RMB Income Fund",
         "aliases": ["gcrif", "china rmb", "rmb income"],
         "admin_format": "waystone_investone",
-        "base_currency": "USD",
+        # CNH, not USD: Waystone strikes the fund and every share class in CNH,
+        # and nav_parser reads the pack as CNH-based. Andy, 2026-09-22 (3678):
+        # "the reporting currency is cnh". Maia's 'Fund CCY' for gcrif is USD,
+        # so it is a different basis from this, not a label for it.
+        "base_currency": "CNH",
         "maia": False,   # no Maia position view ingested for GCRIF yet
         "sections": ["aum", "currency"],
     },
