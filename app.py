@@ -1143,13 +1143,10 @@ async def recalc_single_bond(isin: str, date: str, portfolio_id: str = "wnbf"):
         d0 = datetime.strptime(date, "%Y-%m-%d")
         c1_date = (d0 + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        # Fetch conventions fresh from the canonical static view (not a gateway
-        # cache). v_bond_static, never bond_reference/bond_identity directly: an
-        # override from one base table beat the view's precedence and priced
-        # this recalc on different static from every engine (T-88, 2026-09-22).
+        # Fetch conventions from bond_reference directly (not gateway cache)
         from recon_db import BOND_DATA_URL, _bond_data_headers
         ref_resp = await client.get(
-            f"{BOND_DATA_URL}/rest/v1/v_bond_static",
+            f"{BOND_DATA_URL}/rest/v1/bond_reference",
             headers=_bond_data_headers(),
             params={"isin": f"eq.{isin}", "select": "coupon,maturity_date,day_count,frequency,issue_date,accrual_date"},
         )

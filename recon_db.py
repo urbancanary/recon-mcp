@@ -170,27 +170,6 @@ async def sync_orca_holdings(portfolio_id: str = "wnbf") -> dict:
 # These local tables power the recon_view JOINs (fast, indexed).
 # Called on upload and on startup.
 
-#: Calc fields the mirror takes from v_bond_static rather than the base table
-#: it otherwise mirrors (T-88, 2026-09-22). Display columns stay as mirrored.
-IDENTITY_CALC_FIELDS = ("coupon", "maturity_date", "business_day_convention")
-REFERENCE_CALC_FIELDS = ("coupon", "maturity_date", "day_count", "frequency", "accrual_date")
-
-
-def overlay_canonical_static(row: dict, static_by_isin: dict, fields) -> dict:
-    """Replace a mirrored row's calc fields with the canonical view's values.
-
-    A bond the view does not return keeps its row unchanged: the view is the
-    contract, but a mirror row is not dropped on a transient read gap.
-    """
-    s = static_by_isin.get(row.get("isin"))
-    if not s:
-        return row
-    out = dict(row)
-    for f in fields:
-        out[f] = s.get(f)
-    return out
-
-
 async def sync_bond_data(isins: list[str] = None) -> dict:
     """Sync bond identity, reference, and analytics from bond-data into local tables.
 
@@ -244,17 +223,6 @@ async def sync_bond_data(isins: list[str] = None) -> dict:
                 "select": "isin,ticker_description,currency,standard_country,sector,applied_rating,coupon,maturity_date,day_count,frequency,accrual_date",
             },
         )
-        # Calc fields come from the canonical view, never the base tables
-        # (T-88): overlaid onto the mirrored rows below so the local copy and
-        # its static hash carry the same static every engine prices on.
-        static_req = client.get(
-            f"{BOND_DATA_URL}/rest/v1/v_bond_static",
-            headers=bdh,
-            params={
-                "isin": f"in.({isin_filter})",
-                "select": "isin,coupon,maturity_date,day_count,frequency,accrual_date,business_day_convention",
-            },
-        )
         analytics_req = client.get(
             f"{BOND_DATA_URL}/rest/v1/bond_analytics",
             headers=bdh,
@@ -264,26 +232,20 @@ async def sync_bond_data(isins: list[str] = None) -> dict:
             },
         )
 
-        id_resp, ref_resp, static_resp, ana_resp = await asyncio.gather(
-            identity_req, reference_req, static_req, analytics_req, return_exceptions=True
+        id_resp, ref_resp, ana_resp = await asyncio.gather(
+            identity_req, reference_req, analytics_req, return_exceptions=True
         )
-
-    static_by_isin: dict[str, dict] = {}
-    if not isinstance(static_resp, Exception) and static_resp.status_code == 200:
-        static_by_isin = {r["isin"]: r for r in static_resp.json() if r.get("isin")}
 
     # Upsert each into local tables in Athena Supabase
     identity_by_isin: dict[str, dict] = {}
     if not isinstance(id_resp, Exception) and id_resp.status_code == 200:
-        rows = [overlay_canonical_static(r, static_by_isin, IDENTITY_CALC_FIELDS)
-                for r in id_resp.json()]
+        rows = id_resp.json()
         if rows:
             identity_by_isin = {r["isin"]: r for r in rows if r.get("isin")}
             counts["local_bond_identity"] = await _upsert("local_bond_identity", rows, "isin")
 
     if not isinstance(ref_resp, Exception) and ref_resp.status_code == 200:
-        rows = [overlay_canonical_static(r, static_by_isin, REFERENCE_CALC_FIELDS)
-                for r in ref_resp.json()]
+        rows = ref_resp.json()
         if rows:
             # Stamp current_static_hash so v_stale_calcs can detect drift on
             # any recon_calcs row whose calc_static_hash no longer matches.
