@@ -26,29 +26,10 @@ GA10_GATEWAY_URL = os.environ.get(
 # GAE backend now in the recalc path directly (post-Worker-bypass).
 # Engine_hash from this URL is what gets stamped on recon_calcs and what
 # the cron compares against for engine-drift detection.
-#
-# NO appspot default (backlog 3061): the retired future-footing host was a
-# stale-resolution source for exactly the comparison this URL exists to make
-# — if auth-mcp ever points GA10_PRICING_URL elsewhere, a literal here would
-# keep reporting the OLD engine's hash as "current" and engine-drift would
-# silently stop firing. Resolved lazily so the module imports without the env.
-_ga10_backend_url = ""
-
-
-def ga10_backend_url() -> str:
-    """GA10 engine backend base URL: env override → auth-mcp.
-
-    Env var name kept as a fallback so an explicit override still works.
-    Returns "" when neither is set — fetch_engine_version skips a blank URL
-    (that is a missing engine hash, not a missing price).
-    """
-    global _ga10_backend_url
-    if not _ga10_backend_url:
-        _ga10_backend_url = os.environ.get("GA10_BACKEND_URL", "")
-    if not _ga10_backend_url:
-        from auth_client import get_service_url
-        _ga10_backend_url = get_service_url("GA10_PRICING_URL") or ""
-    return _ga10_backend_url.rstrip("/")
+GA10_BACKEND_URL = os.environ.get(
+    "GA10_BACKEND_URL",
+    "https://future-footing-414610.uc.r.appspot.com",
+)
 
 
 def compute_static_hash(ref: Optional[dict], identity: Optional[dict]) -> Optional[str]:
@@ -117,7 +98,7 @@ async def fetch_engine_version() -> dict:
 
     pricing = await _get(GA10_PRICING_URL)
     gateway = await _get(GA10_GATEWAY_URL)
-    backend = await _get(ga10_backend_url())
+    backend = await _get(GA10_BACKEND_URL)
     return {"pricing": pricing, "gateway": gateway, "backend": backend}
 
 

@@ -24,7 +24,6 @@ packs via the parser's valuation_date).
 import asyncio
 import json
 import logging
-import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -147,25 +146,7 @@ async def ingest_admin_payload(pid: str, parsed: dict) -> str:
 
 # ── GA10 marks (the independent third leg) ─────────────────────────────────
 
-_gae_url_cache = ""
-
-
-def _gae_url() -> str:
-    """GA10 pricing backend, lazily: env override → auth-mcp.
-
-    Same host recon_engine calls, and the same laziness as its _ga10_pricing()
-    — import-time resolution made a module unimportable without the Railway
-    env var. Replaces the retired future-footing appspot literal (backlog 3061).
-    """
-    global _gae_url_cache
-    if not _gae_url_cache:
-        _gae_url_cache = os.environ.get("GA10_PRICING_URL", "")
-    if not _gae_url_cache:
-        from auth_client import get_service_url
-        _gae_url_cache = get_service_url("GA10_PRICING_URL")
-    if not _gae_url_cache:
-        raise RuntimeError("GA10_PRICING_URL unavailable from auth-mcp")
-    return _gae_url_cache.rstrip("/")
+_GAE_URL = "https://future-footing-414610.uc.r.appspot.com"  # same as recon_engine
 
 
 async def _ga10_batch(prices: dict, settle_iso: str, api_key: str) -> dict:
@@ -185,7 +166,7 @@ async def _ga10_batch(prices: dict, settle_iso: str, api_key: str) -> dict:
          "Inventory Date": inv_date} for i, p in prices.items()]}
     async def _post():
         async with httpx.AsyncClient(timeout=120.0) as c:
-            return await c.post(f"{_gae_url()}/api/v1/portfolio/analysis",
+            return await c.post(f"{_GAE_URL}/api/v1/portfolio/analysis",
                                 json=payload,
                                 headers={"Content-Type": "application/json",
                                          "X-API-Key": api_key})

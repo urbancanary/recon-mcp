@@ -81,10 +81,8 @@ def stub_ga10(monkeypatch):
 
 
 def _calc():
-    # gae_url is passed in, not resolved inside: the module no longer carries a
-    # hardcoded appspot host (backlog 3061) and the test must not need auth-mcp.
     return asyncio.run(recon_engine._calc_admin_analytics(
-        {"XS0000000001": 98.5}, "2026-08-10", "https://ga10.test"))
+        {"XS0000000001": 98.5}, "2026-08-10"))
 
 
 def test_accrued_lands_in_the_column_the_other_writers_fill(stub_ga10):

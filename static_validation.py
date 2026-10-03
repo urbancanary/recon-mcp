@@ -45,7 +45,6 @@ found among the trades we hold" — never "the static is correct".
 from __future__ import annotations
 
 import logging
-import os
 
 import httpx
 
@@ -61,22 +60,7 @@ EXCEPTIONS: dict[str, str] = {}
 # 1.8% coupon) is 0.003, an order of magnitude above this.
 _TOL_PER100 = 0.0005
 
-def _gae_url() -> str:
-    """GA10 pricing backend, lazily — same laziness as recon_engine._ga10_pricing.
-
-    env override first (Railway sets GA10_PRICING_URL), then auth-mcp. Resolved
-    per call rather than at import so this module stays importable anywhere
-    without the env var. get_service_url caches internally, so the cost is a
-    dict lookup after the first call. Replaces the retired future-footing
-    appspot host literal (backlog 3061)."""
-    url = os.environ.get("GA10_PRICING_URL", "")
-    if not url:
-        from auth_client import get_service_url
-        url = get_service_url("GA10_PRICING_URL")
-    if not url:
-        raise RuntimeError("GA10_PRICING_URL unavailable from auth-mcp")
-    return url.rstrip("/")
-
+_GAE_URL = "https://future-footing-414610.uc.r.appspot.com"
 _TRADE_TYPES = ("BUY", "SELL")
 
 
@@ -163,7 +147,7 @@ async def _ga10_accrued_batch(prices: dict, settle: str,
         for i, p in prices.items()]}
     try:
         async with httpx.AsyncClient(timeout=120.0) as c:
-            r = await c.post(f"{_gae_url()}/api/v1/portfolio/analysis",
+            r = await c.post(f"{_GAE_URL}/api/v1/portfolio/analysis",
                              json=payload,
                              headers={"X-API-Key": api_key,
                                       "Content-Type": "application/json"})
