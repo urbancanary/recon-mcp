@@ -185,8 +185,45 @@ async def _static_watch_loop():
         await asyncio.sleep(_STATIC_WATCH_INTERVAL)
 
 
+async def _prime_service_urls() -> None:
+    """Resolve the auth-mcp service URLs once, off the event loop (5414).
+
+    ``auth_client.get_service_url`` is synchronous — ``httpx.get`` on the
+    calling thread. The GA10 resolvers in ``recon_engine``, ``calc_hashes`` and
+    ``aum_orchestrator`` call it from inside ``async`` paths and the startup
+    backfill; on a slow auth-mcp lookup that blocks the event loop and every
+    request — including /health — queues behind it. That is what took
+    recon.x-trillion.com down for 10+ minutes after handoff-3061 deployed.
+
+    Do the resolution here in a worker thread so every later resolver call is an
+    in-process cache hit. Failures are logged, not raised: the resolvers still
+    retry lazily — this only removes the blocking fast-path.
+    """
+    def _resolve() -> None:
+        from auth_client import get_service_url
+        import aum_orchestrator
+        import calc_hashes
+        import recon_engine
+
+        # GA10_PRICING_URL is what all three resolvers ask auth-mcp for.
+        get_service_url("GA10_PRICING_URL")
+        for resolve in (recon_engine._ga10_pricing,
+                        calc_hashes.ga10_backend_url,
+                        aum_orchestrator._gae_url):
+            try:
+                resolve()
+            except Exception as exc:  # no env / no auth-mcp → lazy retry later
+                logger.warning("service-URL prime (%s) failed: %s", resolve.__name__, exc)
+
+    try:
+        await asyncio.to_thread(_resolve)
+    except Exception as exc:
+        logger.warning("service-URL prime failed (will retry lazily): %s", exc)
+
+
 @app.on_event("startup")
 async def _startup():
+    await _prime_service_urls()
     asyncio.create_task(_startup_backfill())
     asyncio.create_task(_static_watch_loop())
     # Periodic safety-net for the calc-staleness detector. Set
