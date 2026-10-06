@@ -37,9 +37,18 @@ In `bbg_parser.py` only:
 - Preserve the existing `oad_bonds` key (now the derived primary) for backward
   compatibility with `recon_engine.py:1487`, plus add `mod_dur_bonds` and `oad_only_bonds`.
 
-Test: new `tests/test_bbg_parser_duration.py` builds BBG-shaped workbooks for both
+Test added: `tests/test_bbg_parser_duration.py` builds BBG-shaped workbooks for both
 layouts (Mod Dur only, OAD only, and both present) and asserts each measure is captured
 separately and the primary stays mod-dur-preferred.
+
+**Test execution note:** this environment has no `pytest`/`pandas`/`openpyxl` and no
+network to install them, so the pytest suite could not be run here. The changed code
+path (`parse_bbg_export`) was exercised directly against a minimal in-process pandas
+shim covering all three layouts — every assertion passed — and all three changed files
+byte-compile. `tests/test_bbg_parser_duration.py` should be run in CI to confirm.
+
+Landed in commit `b3f2075` (`bbg_parser.py`, `recon_engine.py`,
+`tests/test_bbg_parser_duration.py`).
 
 ### Remaining (bundled) ask — NOT done here
 
