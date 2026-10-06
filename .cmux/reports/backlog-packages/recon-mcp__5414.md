@@ -53,6 +53,26 @@ cache hit and never touches the network from the loop.
    `get_service_url` after priming (cache hit), and that the prime itself runs
    off the event-loop thread.
 
+## Verification
+
+This clone has no network and only Python 3.9 with none of `requirements.txt`
+installed, so `pytest` could not be installed and the suite could not be run
+here. I verified the changed code directly instead:
+
+- **Real-module check** (throwaway harness, since removed): loaded `app`,
+  `aum_orchestrator`, `calc_hashes`, `recon_engine` with the heavy siblings
+  stubbed (PEP 563 flag, because 3.9 cannot evaluate the modules' `dict | None`
+  annotations) and ran the actual `_prime_service_urls` and resolvers. All 8
+  checks pass: the auth-mcp lookup runs on a worker thread (`loop=8319…,
+  worker=6143…`), the prime fills all three resolver caches, and after priming
+  `aum_orchestrator._gae_url()` / `calc_hashes.ga10_backend_url()` return the
+  cached value with **zero** calls to the sync `get_service_url`.
+- **Syntax check**: `app.py`, `aum_orchestrator.py`, `calc_hashes.py`,
+  `recon_engine.py`, `static_validation.py`, `tests/test_admin_analytics_columns.py`,
+  `tests/test_ga10_url_prime.py` all compile.
+- `tests/test_ga10_url_prime.py` is the durable version of the harness check;
+  it needs a box with pytest + deps to actually run (CI), which this lane lacks.
+
 ## Remaining asks in this item (not closed here)
 
 - **Hold live `/health` for 10 min after a deploy.** This lane cannot deploy
@@ -67,7 +87,7 @@ cache hit and never touches the network from the loop.
   so explicitly).
 
 <!-- lane-result
-FIXED: none
+FIXED: 5414
 ALREADY_FIXED: none
 DECISION: none
 -->
