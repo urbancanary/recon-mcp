@@ -1452,7 +1452,7 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
     price_bonds = bbg_result.get("price_bonds", {})
     accrued_bonds = bbg_result.get("bonds", {})
     yield_bonds = bbg_result.get("ytw_bonds", bbg_result.get("yield_bonds", {}))
-    oad_bonds = bbg_result.get("oad_bonds", {})
+    duration_bonds = bbg_result.get("duration_bonds") or bbg_result.get("oad_bonds", {})
     mv_bonds = bbg_result.get("mv_bonds", {})
     position_bonds = bbg_result.get("position_bonds", {})
     issue_date_bonds = bbg_result.get("issue_date_bonds", {})
@@ -1484,7 +1484,7 @@ async def process_bbg_upload(file_bytes: bytes, filename: str,
             "price": price_bonds.get(isin),
             "accrued": accrued_bonds.get(isin),
             "yield_to_worst": yield_bonds.get(isin),
-            "duration": oad_bonds.get(isin),
+            "duration": duration_bonds.get(isin),
             "mv": mv_bonds.get(isin),
             "par": position_bonds.get(isin),
             "issue_date": issue_date_bonds.get(isin),

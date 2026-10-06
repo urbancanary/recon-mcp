@@ -233,7 +233,8 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
         ytw_col = col_map.get('ytw')
         yield_col = ytm_col or ytw_col  # Prefer YTM for primary yield_bonds
         price_col = col_map.get('price')
-        oad_col = col_map.get('mod_dur') or col_map.get('oad')  # Prefer mod dur over OAD
+        mod_dur_col = col_map.get('mod_dur')
+        oad_col = col_map.get('oad')
         mv_col = col_map.get('mv')
         position_col = col_map.get('position')
         issue_date_col = col_map.get('issue_date')
@@ -243,7 +244,10 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
         ytm_bonds = {}      # YTM specifically
         ytw_bonds = {}      # YTW specifically
         price_bonds = {}
-        oad_bonds = {}
+        mod_dur_bonds = {}    # Modified Duration, when the file carries that column
+        oad_bonds = {}        # Option-Adjusted Duration, when the file carries that column
+        duration_bonds = {}   # Primary duration per ISIN, mod_dur preferred (unchanged value)
+        duration_measure_bonds = {}  # Which measure each primary duration came from
         mv_bonds = {}         # Market value per bond
         position_bonds = {}   # Position/par per bond
         issue_date_bonds = {}   # Issue date per bond
@@ -322,7 +326,16 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
                 except (ValueError, TypeError):
                     pass
 
-            # Extract OAD (Option-Adjusted Duration) if column present
+            # Capture each duration measure into its own dict — the source
+            # column is never coalesced away, so a layout change cannot
+            # silently swap measures behind the same stored value.
+            if mod_dur_col is not None:
+                try:
+                    md = float(row[mod_dur_col])
+                    if not (isinstance(md, float) and (md != md)):  # not NaN
+                        mod_dur_bonds[isin] = md
+                except (ValueError, TypeError):
+                    pass
             if oad_col is not None:
                 try:
                     oad = float(row[oad_col])
@@ -330,6 +343,14 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
                         oad_bonds[isin] = oad
                 except (ValueError, TypeError):
                     pass
+            # Primary duration: mod_dur preferred, OAD fallback — same value the
+            # old coalesced line produced, now with provenance attached.
+            if isin in mod_dur_bonds:
+                duration_bonds[isin] = mod_dur_bonds[isin]
+                duration_measure_bonds[isin] = 'mod_dur'
+            elif isin in oad_bonds:
+                duration_bonds[isin] = oad_bonds[isin]
+                duration_measure_bonds[isin] = 'oad'
 
             # Extract Market Value if column present
             if mv_col is not None:
@@ -555,6 +576,8 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
         bbg_securities_mv = sum(mv_bonds.values()) if mv_bonds else None
 
         yield_source = 'YTM' if col_map.get('ytm') else ('YTW' if col_map.get('ytw') else 'none')
+        # Which duration measure this file's primary duration is drawn from.
+        duration_measure = 'mod_dur' if col_map.get('mod_dur') else ('oad' if col_map.get('oad') else None)
         logger.info(
             "BBG export parsed: %d bonds, as_of=%s, settle=%s, base_ccy=%s, yield_col=%s (%d bonds), "
             "price_bonds=%d, oad_bonds=%d, mv_bonds=%d, issue_dates=%d, maturity_dates=%d, coupons=%d, "
@@ -575,7 +598,11 @@ def parse_bbg_export(xls_bytes: bytes) -> dict:
             "ytm_bonds": ytm_bonds,
             "ytw_bonds": ytw_bonds,
             "price_bonds": price_bonds,
+            "duration_bonds": duration_bonds,
+            "mod_dur_bonds": mod_dur_bonds,
             "oad_bonds": oad_bonds,
+            "duration_measure_bonds": duration_measure_bonds,
+            "duration_measure": duration_measure,
             "mv_bonds": mv_bonds,
             "position_bonds": position_bonds,
             "issue_date_bonds": issue_date_bonds,
