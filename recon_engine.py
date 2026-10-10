@@ -258,7 +258,7 @@ def parse_maia_tsv(tsv: str) -> tuple[list[dict], dict]:
 
 # ── Admin prices → bond-data ────────────────────────────────────────────────
 
-async def _calc_admin_analytics(prices: dict, price_date: str) -> dict:
+async def _calc_admin_analytics(prices: dict, price_date: str, gae_url: str) -> dict:
     """QuantLib analytics for admin prices, via GA10 /api/v1/portfolio/analysis.
 
     `prices` is {isin: clean_price}. Returns {isin: {column: value}} ready to
@@ -306,7 +306,7 @@ async def _calc_admin_analytics(prices: dict, price_date: str) -> dict:
         logger.error("GA10_API_KEY missing — admin prices will store without analytics")
         return {}
 
-    GAE_URL = "https://future-footing-414610.uc.r.appspot.com"
+    GAE_URL = gae_url
     inv_date = price_date.replace("-", "/")
     out: dict = {}
 
@@ -438,7 +438,7 @@ async def _store_admin_prices_to_bond_data(admin_bonds: list[dict], price_date: 
 
     # Calculate before writing, so price and analytics land in one upsert.
     analytics = await _calc_admin_analytics(
-        {r["isin"]: r["price"] for r in rows}, price_date
+        {r["isin"]: r["price"] for r in rows}, price_date, _ga10_pricing()
     )
     for r in rows:
         r.update(analytics.get(r["isin"], {}))
@@ -753,7 +753,7 @@ async def recalc_with_bbg_prices(bbg_prices: dict, price_date: str,
     settle_t0 = price_date
     settle_c1 = (pd_dt + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    GAE_URL = "https://future-footing-414610.uc.r.appspot.com"
+    GAE_URL = _ga10_pricing()
 
     def _payload(settle_iso: str) -> dict:
         inv_date = settle_iso.replace("-", "/")
