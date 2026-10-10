@@ -967,6 +967,25 @@ def parse_nav_report(file_path_or_bytes) -> dict:
     if not valuation_date:
         raise ValueError("Could not extract valuation date from NAV report")
 
+    # ─── 1b. Structural coverage of THIS file ────────────────────────────
+    # The warnings below are how this parser says "I could not read part of
+    # the report". They only ever went to the log, so an ingest could store a
+    # valuation with a silently-defaulted field and nothing on the page said
+    # so — which is also why no redacted sample could pin the parsers: with
+    # no record of what a report *did* contain, a coverage gap is
+    # indistinguishable from a fund that genuinely has no such line.
+    #
+    # Collected, not raised: a missing optional section must never cost us the
+    # ingest (the opposite failure). Reconcile-style warnings that fire on
+    # amounts we did read stay warnings.
+    #
+    # Declared here, above the first use, because it is used by sections 2-4 —
+    # a plain module-level list would leak across parse_nav_report calls.
+    _coverage: list[dict] = []
+
+    def _cov(section: str, detail: str, count: int | None = None):
+        _coverage.append({"section": section, "detail": detail, "count": count})
+
     total_cash = cash_cnh + foreign_currency
     # Cash as the ADMIN reports it, captured before total_cash is overwritten
     # further down with the NAV-minus-securities residual. This is the figure a
@@ -998,6 +1017,9 @@ def parse_nav_report(file_path_or_bytes) -> dict:
                 break
         if local_col is None:
             local_col = 17
+            _cov("accrued_income", "Gross Income (Local) header not found; "
+                 "column 17 (GCRIF-era default) used — accrued_by_sedol may "
+                 "be wrong for this fund")
             logger.warning(
                 "Accrued-income sheet: 'Gross Income (Local)' header not found; "
                 "falling back to column 17 (GCRIF-era default) — accrued_by_sedol "
@@ -1024,6 +1046,7 @@ def parse_nav_report(file_path_or_bytes) -> dict:
                 if sedol:
                     accrued_by_sedol[sedol] = accrued_local
     except Exception as e:
+        _cov("accrued_income", f"sheet not read ({e})")
         logger.warning("Could not parse accrued income sheet: %s", e)
 
     # ─── 3. Holdings from Detailed_Security_Valuation ────────────────────
@@ -1042,6 +1065,8 @@ def parse_nav_report(file_path_or_bytes) -> dict:
         # Keep only rows that have actual holdings (positive MV)
         df_h = df_h[pd.to_numeric(df_h.get("Market Value - Base", pd.Series()), errors="coerce").notna()]
     except Exception as e:
+        _cov("holdings", f"Detailed_Security_Valuation not read ({e}) — "
+             "holdings come back empty")
         logger.warning("Could not parse Detailed_Security_Valuation (malformed/legacy report?): %s", e)
         df_h = pd.DataFrame(columns=["Market Value - Base"])
 
@@ -1161,6 +1186,8 @@ def parse_nav_report(file_path_or_bytes) -> dict:
     # simply wrong for every non-GCRIF fund — e.g. GDBF is USD-based).
     base_currency = base_ccy_raw or "CNH"
     if not base_ccy_raw:
+        _cov("fund_identity", "FUND BASE CCY not read from the report header; "
+             "defaulted to CNH (GCRIF's base) — verify for this fund")
         logger.warning(
             "Could not read FUND BASE CCY from report header; defaulting to "
             "CNH (GCRIF's base) — verify this is correct for this fund"
@@ -1229,6 +1256,7 @@ def parse_nav_report(file_path_or_bytes) -> dict:
         hedge_ledger["difference"] = diff
         hedge_ledger["reconciles"] = abs(diff) < 0.01
         if not hedge_ledger["reconciles"]:
+            _cov("hedge_ledger", "does not reconcile to Balance Sheet", diff)
             logger.warning(
                 "FX hedge ledger does NOT reconcile to Balance Sheet: "
                 "ledger total_pl=%.2f vs balance_sheet_pl=%.2f (diff=%.2f)",
@@ -1241,6 +1269,8 @@ def parse_nav_report(file_path_or_bytes) -> dict:
         hedge_ledger["difference"] = None
         hedge_ledger["reconciles"] = (hedge_ledger["total_pl"] == 0.0)
         if hedge_ledger["total_pl"] != 0.0:
+            _cov("hedge_ledger", "non-zero forward P/L with no Balance Sheet "
+                 "forward line to reconcile against", hedge_ledger["total_pl"])
             logger.warning(
                 "FX hedge ledger has non-zero P/L (%.2f) but no matching "
                 "Balance Sheet forward-contract line was found to reconcile against",
@@ -1399,6 +1429,8 @@ def parse_nav_report(file_path_or_bytes) -> dict:
             _declared = valuation_point(_pid)["local_time"]
             valuation_time_matches = (_declared == valuation_time)
             if not valuation_time_matches:
+                _cov("fund_identity", "valuation point disagrees with the "
+                     f"declared {_declared} (report says {valuation_time})")
                 logger.warning(
                     "VALUATION POINT MISMATCH for %s: admin report says %s, "
                     "fund_config.py declares %s — fix fund_config.py",
@@ -1424,6 +1456,9 @@ def parse_nav_report(file_path_or_bytes) -> dict:
         "hedge_ledger": hedge_ledger,
         "currency_exposure": currency_exposure,
         "share_classes": share_classes,
+        # Sections this report did not carry (or carried in a shape not
+        # recognised). Empty means full structural coverage — see 7a-bis.
+        "parse_coverage": _coverage,
         "parsed_at": datetime.utcnow().isoformat() + "Z",
     }
 

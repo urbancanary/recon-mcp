@@ -524,8 +524,15 @@ async def track_upload(portfolio_id: str, source: str, date: str,
                        file_path: str, file_name: str, file_size: int,
                        file_hash: str, uploaded_by: str,
                        bonds_parsed: int = 0, parse_status: str = "ok",
-                       parse_error: str = None) -> int:
-    """Insert/upsert a row in recon_uploads."""
+                       parse_error: str = None, coverage_note: str = None) -> int:
+    """Insert/upsert a row in recon_uploads.
+
+    coverage_note carries the parser's own record of what the file did NOT
+    contain (see nav_parser/bbg_parser parse_coverage). Without it, a
+    valuation stored with a silently-defaulted section is indistinguishable
+    from a complete one on the page. Column added by sql/008 — pass None until
+    it is applied and the write is simply what it always was.
+    """
     row = {
         "portfolio_id": portfolio_id,
         "source": source,
@@ -539,12 +546,24 @@ async def track_upload(portfolio_id: str, source: str, date: str,
         "parse_status": parse_status,
         "parse_error": parse_error,
     }
+    if coverage_note is not None:
+        row["coverage_note"] = coverage_note
     return await _upsert("recon_uploads", [row], "portfolio_id,source,date")
+
+
+def coverage_note(coverage: list | None) -> str | None:
+    """Render a parser's parse_coverage list as the one-line note stored on
+    the upload row. None when the parse reported full coverage — an empty
+    string would read as 'something was wrong' on a row where nothing was."""
+    if not coverage:
+        return None
+    return "; ".join(
+        f"{c.get('section', '?')}: {c.get('detail', '?')}" for c in coverage)
 
 
 async def store_raw_upload(source: str, portfolio_id: str, date: str,
                            file_bytes: bytes, filename: str, uploaded_by: str,
-                           bonds_parsed: int = 0) -> str:
+                           bonds_parsed: int = 0, coverage: list | None = None) -> str:
     """One-call helper: upload to Storage + track in recon_uploads.
 
     Returns the storage path, or empty string on failure.
@@ -567,6 +586,7 @@ async def store_raw_upload(source: str, portfolio_id: str, date: str,
         file_hash=_file_hash(file_bytes),
         uploaded_by=uploaded_by,
         bonds_parsed=bonds_parsed,
+        coverage_note=coverage_note(coverage),
     )
     return path
 
