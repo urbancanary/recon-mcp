@@ -60,7 +60,6 @@ EXCEPTIONS: dict[str, str] = {}
 # 1.8% coupon) is 0.003, an order of magnitude above this.
 _TOL_PER100 = 0.0005
 
-_GAE_URL = "https://future-footing-414610.uc.r.appspot.com"
 _TRADE_TYPES = ("BUY", "SELL")
 
 
@@ -117,7 +116,7 @@ async def _orca_trades(pid: str) -> list[dict]:
 
 
 async def _ga10_accrued_batch(prices: dict, settle: str,
-                              api_key: str) -> dict:
+                              api_key: str, ga10_url: str) -> dict:
     """{isin: analytics} for a whole settlement date, via portfolio/analysis.
 
     USE THIS ENDPOINT, NOT /api/v1/bond/analysis/flexible. Measured
@@ -147,7 +146,7 @@ async def _ga10_accrued_batch(prices: dict, settle: str,
         for i, p in prices.items()]}
     try:
         async with httpx.AsyncClient(timeout=120.0) as c:
-            r = await c.post(f"{_GAE_URL}/api/v1/portfolio/analysis",
+            r = await c.post(f"{ga10_url.rstrip('/')}/api/v1/portfolio/analysis",
                              json=payload,
                              headers={"X-API-Key": api_key,
                                       "Content-Type": "application/json"})
@@ -171,8 +170,8 @@ async def _ga10_accrued_batch(prices: dict, settle: str,
         return {}
     items = list(prices.items())
     mid = len(items) // 2
-    left = await _ga10_accrued_batch(dict(items[:mid]), settle, api_key)
-    right = await _ga10_accrued_batch(dict(items[mid:]), settle, api_key)
+    left = await _ga10_accrued_batch(dict(items[:mid]), settle, api_key, ga10_url)
+    right = await _ga10_accrued_batch(dict(items[mid:]), settle, api_key, ga10_url)
     return {**left, **right}
 
 
@@ -182,7 +181,7 @@ def _exception_for(isin: str, settle: str) -> str | None:
 
 async def validate(pid: str = "gdbft") -> dict:
     """Check every settled trade's accrued against static. Trades are gospel."""
-    from auth_client import get_api_key
+    from auth_client import get_api_key, get_service_url
     try:
         trades = await _orca_trades(pid)
     except Exception as e:
@@ -192,6 +191,10 @@ async def validate(pid: str = "gdbft") -> dict:
     if not api_key:
         return {"status": "error", "error": "GA10_API_KEY unavailable",
                 "portfolio_id": pid}
+    ga10_url = get_service_url("GA10_PRICING_URL", requester="recon-static-validation")
+    if not ga10_url:
+        return {"status": "error", "error": "GA10_PRICING_URL unavailable",
+                "portfolio_id": pid}
 
     # One GA10 call per settlement date, not per trade.
     by_settle: dict[str, dict] = {}
@@ -200,7 +203,7 @@ async def validate(pid: str = "gdbft") -> dict:
             float(t.get("price") or 100.0)
     marks: dict[str, dict] = {}
     for settle, prices in by_settle.items():
-        got = await _ga10_accrued_batch(prices, settle, api_key)
+        got = await _ga10_accrued_batch(prices, settle, api_key, ga10_url)
         for isin, b in got.items():
             marks[f"{isin}@{settle}"] = b
 

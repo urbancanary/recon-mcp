@@ -146,7 +146,23 @@ async def ingest_admin_payload(pid: str, parsed: dict) -> str:
 
 # ── GA10 marks (the independent third leg) ─────────────────────────────────
 
-_GAE_URL = "https://future-footing-414610.uc.r.appspot.com"  # same as recon_engine
+_ga10_pricing_url = ""
+
+
+def _ga10_pricing() -> str:
+    """GA10_PRICING_URL, lazily: env override → auth-mcp. Same idiom as
+    recon_engine._ga10_pricing() — import-time raise made the module
+    unimportable anywhere without the Railway env var."""
+    global _ga10_pricing_url
+    if not _ga10_pricing_url:
+        import os
+        _ga10_pricing_url = os.environ.get("GA10_PRICING_URL", "")
+    if not _ga10_pricing_url:
+        from auth_client import get_service_url
+        _ga10_pricing_url = get_service_url("GA10_PRICING_URL", requester="recon-mcp-aum")
+    if not _ga10_pricing_url:
+        raise RuntimeError("GA10_PRICING_URL unavailable from auth-mcp")
+    return _ga10_pricing_url
 
 
 async def _ga10_batch(prices: dict, settle_iso: str, api_key: str) -> dict:
@@ -160,13 +176,14 @@ async def _ga10_batch(prices: dict, settle_iso: str, api_key: str) -> dict:
     """
     if not prices:
         return {}
+    ga10_url = _ga10_pricing()
     inv_date = settle_iso.replace("-", "/")
     payload = {"format": "FLDS", "data": [
         {"BOND_CD": i, "CLOSING PRICE": float(p), "WEIGHTING": 1.0,
          "Inventory Date": inv_date} for i, p in prices.items()]}
     async def _post():
         async with httpx.AsyncClient(timeout=120.0) as c:
-            return await c.post(f"{_GAE_URL}/api/v1/portfolio/analysis",
+            return await c.post(f"{ga10_url.rstrip('/')}/api/v1/portfolio/analysis",
                                 json=payload,
                                 headers={"Content-Type": "application/json",
                                          "X-API-Key": api_key})
